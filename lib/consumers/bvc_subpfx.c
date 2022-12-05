@@ -819,7 +819,7 @@ int bvc_subpfx_process_view(bvc_t *consumer, bgpview_t *view)
   // and then do the complement to find finished sub-pfxs
   if (subpfxs_diff(consumer, view, it, PREV_SUBPFXS, CUR_SUBPFXS, FINISHED,
                               &new_cnt, &finished_cnt) == UINT64_MAX) {
-    fprintf(stderr, "ERROR: Failed to find NEW sub prefixes\n");
+    fprintf(stderr, "ERROR: Failed to find FINISHED sub prefixes\n");
     goto err;
   }
 
