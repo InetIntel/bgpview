@@ -536,8 +536,12 @@ static uint64_t subpfxs_diff(bvc_t *consumer, bgpview_t *view,
     if (j != kh_end(b)) {
       pfx_khash_t *pfx_b = &kh_key(b, j);
       pfx_khash_t *super_pfx_b = &kh_val(b, j);
-      if (bgpstream_pfx_equal(&(super_pfx->pfx), &(super_pfx_b->pfx)) != 0) {
-          continue;
+
+      /* If the super prefix is different, then the origins don't matter
+       * because we need to dump an event regardless
+       */
+      if (bgpstream_pfx_equal(&(super_pfx->pfx), &(super_pfx_b->pfx)) == 0) {
+          goto pfxchangedetected;
       }
 
       if (diff_type == NEW) {
@@ -563,6 +567,7 @@ static uint64_t subpfxs_diff(bvc_t *consumer, bgpview_t *view,
       continue;
     }
 
+pfxchangedetected:
     // this is a new/finished sub-pfx!
     if (dump_subpfx(consumer, view, it, &(pfx->pfx), &(super_pfx->pfx),
             diff_type) != 0) {
