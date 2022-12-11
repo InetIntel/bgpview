@@ -520,7 +520,7 @@ static int dump_subpfx(bvc_t *consumer, bgpview_t *view, bgpview_iter_t *it,
 static uint64_t subpfxs_diff(bvc_t *consumer, bgpview_t *view,
                              bgpview_iter_t *it, khash_t(pfx2pfx) * a,
                              khash_t(pfx2pfx) * b, int diff_type,
-                             uint64_t *new_cnt, uint64_t *finished_cnt)
+                             int *origin_changed)
 {
   khiter_t k, j;
   uint64_t cnt = 0;
@@ -544,27 +544,23 @@ static uint64_t subpfxs_diff(bvc_t *consumer, bgpview_t *view,
           goto pfxchangedetected;
       }
 
-      if (diff_type == NEW) {
-          /* Check for the case where the origins have changed -- if they
-           * have, we need to finish the current subpfx event and then also
-           * start a "new" event for the changed origins.
-           */
-          if ((!pt_user_equal(pfx->origins, pfx_b->origins)) ||
-                  (!pt_user_equal(super_pfx->origins, super_pfx_b->origins))) {
-              if (dump_subpfx(consumer, view, it, &(pfx_b->pfx),
-                      &(super_pfx_b->pfx), FINISHED) != 0) {
-                  return UINT64_MAX;
-              }
-              if (dump_subpfx(consumer, view, it, &(pfx->pfx),
-                      &(super_pfx->pfx), NEW) != 0) {
-                  return UINT64_MAX;
-              }
-              (*new_cnt)++;
-              (*finished_cnt)++;
-              cnt += 2;
+      /* Check for the case where the origins have changed -- if they
+       * have, we need to finish the current subpfx event and then also
+       * start a "new" event for the changed origins.
+       */
+      if (*origin_changed == -1) {
+          if (!pt_user_equal(pfx->origins, pfx_b->origins)) {
+              *origin_changed = 1;
+          } else if (!pt_user_equal(super_pfx->origins, super_pfx_b->origins)) {
+              *origin_changed = 1;
+          } else {
+              *origin_changed = 0;
           }
       }
-      continue;
+
+      if (*origin_changed == 0) {
+          continue;
+      }
     }
 
 pfxchangedetected:
@@ -572,11 +568,6 @@ pfxchangedetected:
     if (dump_subpfx(consumer, view, it, &(pfx->pfx), &(super_pfx->pfx),
             diff_type) != 0) {
       return UINT64_MAX;
-    }
-    if (diff_type == NEW) {
-      (*new_cnt)++;
-    } else if (diff_type == FINISHED) {
-      (*finished_cnt)++;
     }
     cnt++;
   }
@@ -734,6 +725,7 @@ int bvc_subpfx_process_view(bvc_t *consumer, bgpview_t *view)
   uint32_t arrival_delay = start_time - view_time;
   uint64_t new_cnt = 0;
   uint64_t finished_cnt = 0;
+  int origin_changed = -1;
 
   // open the output file
   if (!(STATE->outfile = bvcu_open_outfile(STATE->outfile_name,
@@ -818,17 +810,22 @@ int bvc_subpfx_process_view(bvc_t *consumer, bgpview_t *view)
 
   new_cnt = 0;
   finished_cnt = 0;
-  // now that we have a table of sub-prefixes, find out which are new
-  // (i.e., which are in this view but not in the previous one)
-  if (subpfxs_diff(consumer, view, it, CUR_SUBPFXS, PREV_SUBPFXS,
-                              NEW, &new_cnt, &finished_cnt) == UINT64_MAX) {
-    fprintf(stderr, "ERROR: Failed to find NEW sub prefixes\n");
+  origin_changed = -1;
+  // now that we have a table of sub-prefixes, find out which are finished
+  // (i.e., which are not in this view but in the previous one)
+  // NOTE: we check for FINISHED first to ensure that in situations where
+  // the origins have changed for a prefix, the FINISHED event for the
+  // older origins is written before the NEW event for the new origins
+  if ((finished_cnt = subpfxs_diff(consumer, view, it, PREV_SUBPFXS,
+          CUR_SUBPFXS, FINISHED, &origin_changed)) == UINT64_MAX) {
+    fprintf(stderr, "ERROR: Failed to find FINISHED sub prefixes\n");
     goto err;
   }
-  // and then do the complement to find finished sub-pfxs
-  if (subpfxs_diff(consumer, view, it, PREV_SUBPFXS, CUR_SUBPFXS, FINISHED,
-                              &new_cnt, &finished_cnt) == UINT64_MAX) {
-    fprintf(stderr, "ERROR: Failed to find FINISHED sub prefixes\n");
+
+  // and then do the complement to find new / modified sub-pfxs
+  if ((new_cnt = subpfxs_diff(consumer, view, it, CUR_SUBPFXS, PREV_SUBPFXS,
+                              NEW, &origin_changed)) == UINT64_MAX) {
+    fprintf(stderr, "ERROR: Failed to find NEW sub prefixes\n");
     goto err;
   }
 
