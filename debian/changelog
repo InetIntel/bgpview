@@ -1,3 +1,12 @@
+libbgpview2 (2.0.0~rc8) unstable; urgency=medium
+
+  * Fix interval bug
+  * Allow pfx-origins arrays to grow dynamically
+  * Reduce default pfx-origins array size to 32
+  * Edges are now directional
+
+ -- Shane Alcock <shane@alcock.co.nz>  Thu, 24 Nov 2022 15:36:16 +1300
+
 libbgpview2 (2.0.0~rc3) unstable; urgency=medium
 
   * Fix bad prefix bug in pergeo_visibility v6 code
