@@ -74,9 +74,25 @@ typedef struct pt_user {
 
 } pt_user_t;
 
+typedef struct pfx_khash {
+    pt_user_t *origins;
+    bgpstream_pfx_t pfx;
+
+} pfx_khash_t;
+
+uint64_t bgpstream_pfx_khash(const pfx_khash_t node) {
+    return bgpstream_pfx_hash(&(node.pfx));
+}
+
+int bgpstream_pfx_khash_equal(const pfx_khash_t node1,
+        const pfx_khash_t node2) {
+
+    return bgpstream_pfx_equal(&(node1.pfx), &(node2.pfx));
+}
+
 /* Maps sub-prefixes to super prefixes */
-KHASH_INIT(pfx2pfx, bgpstream_pfx_t, bgpstream_pfx_t, 1,
-           bgpstream_pfx_hash_val, bgpstream_pfx_equal_val)
+KHASH_INIT(pfx2pfx, pfx_khash_t, pfx_khash_t, 1,
+        bgpstream_pfx_khash, bgpstream_pfx_khash_equal)
 
 enum {
   NEW = 0,
@@ -236,6 +252,18 @@ static pt_user_t *pt_user_create(void)
   return ptu;
 }
 
+static pt_user_t *pt_user_clone(pt_user_t *orig) {
+
+    pt_user_t *ptu;
+    if ((ptu = pt_user_create()) == NULL) {
+        return NULL;
+    }
+    ptu->ases_cnt = orig->ases_cnt;
+    ptu->ases = calloc(ptu->ases_cnt, sizeof(uint32_t));
+    memcpy(ptu->ases, orig->ases, orig->ases_cnt * sizeof(uint32_t));
+    return ptu;
+}
+
 static int pt_user_contains_asn(pt_user_t *ptu, uint32_t asn)
 {
   int i;
@@ -245,6 +273,30 @@ static int pt_user_contains_asn(pt_user_t *ptu, uint32_t asn)
     }
   }
   return 0;
+}
+
+static int pt_user_equal(pt_user_t *a, pt_user_t *b) {
+
+    int i;
+    if (a == NULL && b == NULL) {
+        return 1;
+    }
+
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+
+    if (a->ases_cnt != b->ases_cnt) {
+        return 0;
+    }
+
+    for (i = 0; i < a->ases_cnt; i++) {
+        if (pt_user_contains_asn(b, a->ases[i]) == 0) {
+            return 0;
+        }
+    }
+
+    return 1;
 }
 
 static int pt_user_add_asn(pt_user_t *ptu, uint32_t asn)
@@ -263,6 +315,11 @@ static int pt_user_add_asn(pt_user_t *ptu, uint32_t asn)
   return 0;
 }
 
+static void free_pfx_hash(pfx_khash_t *pfx, pfx_khash_t *super) {
+    pt_user_destroy(pfx->origins);
+    pt_user_destroy(super->origins);
+}
+
 static bgpstream_patricia_walk_cb_result_t
 find_subpfxs(const bgpstream_patricia_tree_t *const_pt,
              const bgpstream_patricia_node_t *const_node,
@@ -271,6 +328,7 @@ find_subpfxs(const bgpstream_patricia_tree_t *const_pt,
   int i;
   bvc_t *consumer = (bvc_t *)data;
   const bgpstream_pfx_t *pfx = bgpstream_patricia_tree_get_pfx(const_node);
+  pfx_khash_t lookup, super;
 
   // hack around the fact that bgpstream_patricia_tree_get_mincovering_prefix()
   // takes non-const parameters
@@ -343,9 +401,16 @@ find_subpfxs(const bgpstream_patricia_tree_t *const_pt,
 
   // this is a sub-prefix, add it to our table
   int ret;
-  int k = kh_put(pfx2pfx, CUR_SUBPFXS, *pfx, &ret);
+
+  lookup.origins = pt_user_clone(ptu);;
+  memcpy(&(lookup.pfx), pfx, sizeof(bgpstream_pfx_t));
+
+  super.origins = pt_user_clone(super_ptu);
+  memcpy(&(super.pfx), super_pfx, sizeof(bgpstream_pfx_t));
+
+  int k = kh_put(pfx2pfx, CUR_SUBPFXS, lookup, &ret);
   assert(ret > 0); // this prefix must not already be present in the map
-  kh_val(CUR_SUBPFXS, k) = *super_pfx;
+  kh_val(CUR_SUBPFXS, k) = super;
   return BGPSTREAM_PATRICIA_WALK_CONTINUE;
 }
 
@@ -462,17 +527,36 @@ static uint64_t subpfxs_diff(bvc_t *consumer, bgpview_t *view,
     if (kh_exist(a, k) == 0) {
       continue;
     }
-    bgpstream_pfx_t *pfx = &kh_key(a, k);
-    bgpstream_pfx_t *super_pfx = &kh_val(a, k);
+    pfx_khash_t *pfx = &kh_key(a, k);
+    pfx_khash_t *super_pfx = &kh_val(a, k);
     // this prefix must have been a sub-prefix in the previous view,
     // and it must have had the same super prefix
-    if ((j = kh_get(pfx2pfx, b, *pfx)) != kh_end(b) &&
-        bgpstream_pfx_equal(super_pfx, &kh_val(b, j)) != 0) {
-      continue;
+    j = kh_get(pfx2pfx, b, *pfx);
+    if (j != kh_end(b)) {
+      pfx_khash_t *pfx_b = &kh_key(b, j);
+      pfx_khash_t *super_pfx_b = &kh_val(b, j);
+
+      /* If the super prefix is different, then the origins don't matter
+       * because we need to dump an event regardless
+       */
+      if (bgpstream_pfx_equal(&(super_pfx->pfx), &(super_pfx_b->pfx)) == 0) {
+          goto pfxchangedetected;
+      }
+
+      /* Check for the case where the origins have changed -- if they
+       * have, we need to finish the current subpfx event and then also
+       * start a "new" event for the changed origins.
+       */
+      if (pt_user_equal(pfx->origins, pfx_b->origins) &&
+                pt_user_equal(super_pfx->origins, super_pfx_b->origins)) {
+           continue;
+      }
     }
 
+pfxchangedetected:
     // this is a new/finished sub-pfx!
-    if (dump_subpfx(consumer, view, it, pfx, &kh_val(a, k), diff_type) != 0) {
+    if (dump_subpfx(consumer, view, it, &(pfx->pfx), &(super_pfx->pfx),
+            diff_type) != 0) {
       return UINT64_MAX;
     }
     cnt++;
@@ -624,6 +708,7 @@ int bvc_subpfx_process_view(bvc_t *consumer, bgpview_t *view)
   pt_user_t *ptu = NULL;
   bgpstream_as_path_seg_t *origin_seg;
   bgpstream_patricia_node_t *node;
+  pfx_khash_t pfx_k, super_k;
 
   uint32_t start_time = epoch_sec();
   uint32_t view_time = bgpview_get_time(view);
@@ -712,21 +797,28 @@ int bvc_subpfx_process_view(bvc_t *consumer, bgpview_t *view)
   /* iterate through the prefixes in the tree and find the sub-prefixes */
   bgpstream_patricia_tree_walk(STATE->pt, find_subpfxs, consumer);
 
-  // now that we have a table of sub-prefixes, find out which are new
-  // (i.e., which are in this view but not in the previous one)
+  new_cnt = 0;
+  finished_cnt = 0;
+  // now that we have a table of sub-prefixes, find out which are finished
+  // (i.e., which are not in this view but in the previous one)
+  // NOTE: we check for FINISHED first to ensure that in situations where
+  // the origins have changed for a prefix, the FINISHED event for the
+  // older origins is written before the NEW event for the new origins
+  if ((finished_cnt = subpfxs_diff(consumer, view, it, PREV_SUBPFXS,
+          CUR_SUBPFXS, FINISHED)) == UINT64_MAX) {
+    fprintf(stderr, "ERROR: Failed to find FINISHED sub prefixes\n");
+    goto err;
+  }
+
+  // and then do the complement to find new / modified sub-pfxs
   if ((new_cnt = subpfxs_diff(consumer, view, it, CUR_SUBPFXS, PREV_SUBPFXS,
                               NEW)) == UINT64_MAX) {
     fprintf(stderr, "ERROR: Failed to find NEW sub prefixes\n");
     goto err;
   }
-  // and then do the complement to find finished sub-pfxs
-  if ((finished_cnt = subpfxs_diff(consumer, view, it, PREV_SUBPFXS,
-                                   CUR_SUBPFXS, FINISHED)) == UINT64_MAX) {
-    fprintf(stderr, "ERROR: Failed to find NEW sub prefixes\n");
-    goto err;
-  }
 
   // clear the previous map and then rotate
+  kh_foreach(PREV_SUBPFXS, pfx_k, super_k, free_pfx_hash(&pfx_k, &super_k));
   kh_clear(pfx2pfx, PREV_SUBPFXS);
   STATE->current_subpfxs_idx = (STATE->current_subpfxs_idx + 1) % 2;
 
