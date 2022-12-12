@@ -1,3 +1,12 @@
+libbgpview2 (2.0.0~rc_09) unstable; urgency=medium
+
+  * submoas consumer: report new submoas event if the origins change
+    for either prefix
+  * subpfx consumer: always check for FINISHED events before reporting
+    any NEW ones
+
+ -- Shane Alcock <shane@alcock.co.nz>  Mon, 12 Dec 2022 22:33:19 +1300
+
 libbgpview2 (2.0.0~rc8) unstable; urgency=medium
 
   * Fix interval bug
