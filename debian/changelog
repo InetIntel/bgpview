@@ -1,4 +1,4 @@
-libbgpview2 (2.0.0~rc_09) unstable; urgency=medium
+libbgpview2 (2.0.1~gt001) unstable; urgency=medium
 
   * submoas consumer: report new submoas event if the origins change
     for either prefix
