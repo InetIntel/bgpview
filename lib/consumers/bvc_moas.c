@@ -798,6 +798,11 @@ int bvc_moas_process_view(bvc_t *consumer, bgpview_t *view)
     return -1;
   }
 
+  /* remove stale moases and report these that are finished */
+  if (clean_moas(consumer, bgpview_get_time(view), last_valid_ts) != 0) {
+    return -1;
+  }
+
   /* iterate through all prefixes */
   for (bgpview_iter_first_pfx(it, 0 /* all versions */, BGPVIEW_FIELD_ACTIVE);
        bgpview_iter_has_more_pfx(it); bgpview_iter_next_pfx(it)) {
@@ -863,10 +868,6 @@ int bvc_moas_process_view(bvc_t *consumer, bgpview_t *view)
 
   bgpview_iter_destroy(it);
 
-  /* remove stale moases and report these that are finished */
-  if (clean_moas(consumer, bgpview_get_time(view), last_valid_ts) != 0) {
-    return -1;
-  }
 
   if (close_output_log(consumer, bgpview_get_time(view)) != 0) {
     return -1;
