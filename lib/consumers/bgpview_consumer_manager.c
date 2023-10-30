@@ -50,6 +50,7 @@
 
 /* Per-Geo Visibility consumer */
 #include "bvc_pergeovisibility.h"
+#include "bvc_pergeovisibility_ipinfo.h"
 
 /* Announced Prefixes consumer */
 #include "bvc_announcedpfxs.h"

@@ -177,13 +177,17 @@ typedef enum bvc_id {
    * and how long each peer obvserved them */
   BVC_ID_PFX2AS = 19,
 
+  /** Writes information about per-Geo visibility information, where the
+   *  geolocation is performed using ipinfo data.
+   */
+  BVC_ID_PERGEOVISIBILITY_IPINFO = 20,
   /** @todo add more consumers here */
 
   /** Lowest numbered bgpview consumer ID */
   BVC_ID_FIRST = BVC_ID_TEST,
 
   /** Highest numbered bgpview consumer ID */
-  BVC_ID_LAST = BVC_ID_PFX2AS,
+  BVC_ID_LAST = BVC_ID_PERGEOVISIBILITY_IPINFO,
 
 } bvc_id_t;
 
