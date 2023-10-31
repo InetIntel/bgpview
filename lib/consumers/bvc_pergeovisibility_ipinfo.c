@@ -513,7 +513,7 @@ static ip_addr_run_t *update_ip_addr_run(pfx_location_t *loc,
         }
         loc->addr_run_cnt ++;
 
-        run = &(addr_runs[loc->addr_run_cnt - 1]);
+        run = &(loc->addr_runs[loc->addr_run_cnt - 1]);
         run->network_addr = cur_address;
         run->num_ips = num_ips;
     }
@@ -961,7 +961,7 @@ static int init_iso2_map(bvc_t *consumer, khash_t(iso2_map) *map,
 
     int i, len, ret;
     per_geo_t *pg;
-    char *ptr;
+    const char *ptr;
     khint_t k;
 
     for (i = 0; i < ARR_CNT(iso2codes); i++) {
@@ -1086,21 +1086,6 @@ static void destroy_pfx_user_ptr(void *user) {
     clear_name_runs(pfx_cache->cities);
 
     free(pfx_cache);
-}
-
-static int clear_geocache(bvc_t *consumer, bgpview_t *view) {
-    bgpview_iter_t *it = bgpview_iter_create(view);
-    assert(it != NULL);
-
-    for (bgpview_iter_first_pfx(it, 0, BGPVIEW_FIELD_ALL_VALID); //
-            bgpview_iter_has_more_pfx(it);                    //
-            bgpview_iter_next_pfx(it)) {
-        // will call the destroy func itself
-        bgpview_iter_pfx_set_user(it, NULL);
-    }
-
-    bgpview_iter_destroy(it);
-    return 0;
 }
 
 static pfx_location_t *lookup_iso2(khash_t(iso2_runs) **map,
@@ -1237,7 +1222,7 @@ static int update_pfx_geo_named(bvc_t *consumer, khash_t(name_map) *aggs,
         k2 = kh_get(name_map, aggs, kh_key(cached, k));
 
         if (k2 == kh_end(aggs)) {
-            fprintf(stderr, "ERROR: Named location %04x is present in pfx_cache, but not in main aggregation map?\n", kh_key(cached, k));
+            fprintf(stderr, "ERROR: Named location %s is present in pfx_cache, but not in main aggregation map?\n", kh_key(cached, k));
             return -1;
         }
 
@@ -1524,7 +1509,7 @@ bvc_t *bvc_pergeovisibility_ipinfo_alloc() {
 int bvc_pergeovisibility_ipinfo_init(bvc_t *consumer, int argc, char **argv) {
     bvc_pergeovisibility_ipinfo_state_t *state = NULL;
 
-    if ((state = malloc_zero(sizeof(bvc_pergeovisibility_info_state_t))) ==
+    if ((state = malloc_zero(sizeof(bvc_pergeovisibility_ipinfo_state_t))) ==
             NULL) {
         return -1;
     }
