@@ -957,14 +957,14 @@ err:
 }
 
 static int init_iso2_map(bvc_t *consumer, khash_t(iso2_map) *map,
-        const char **iso2codes) {
+        const char **iso2codes, int codecount) {
 
     int i, len, ret;
     per_geo_t *pg;
     const char *ptr;
     khint_t k;
 
-    for (i = 0; i < ARR_CNT(iso2codes); i++) {
+    for (i = 0; i < codecount; i++) {
         uint16_t key;
         len = strlen(iso2codes[i]);
 
@@ -993,7 +993,7 @@ err:
 
 static int create_geo_pfxs_vis(bvc_t *consumer) {
 
-    int country_cnt = 0, i, ret;
+    int country_cnt = 0, i, ret = 0;
     const char **countries_iso2 = NULL;
     const char **country_continents = NULL;
 
@@ -1007,7 +1007,7 @@ static int create_geo_pfxs_vis(bvc_t *consumer) {
     /* TODO insert initialized per_geo_t entries for each known
      * continent, region, country...
      */
-    if (init_iso2_map(consumer, STATE->continents, continent_strings) < 0) {
+    if (init_iso2_map(consumer, STATE->continents, continent_strings, 8) < 0) {
         return -1;
     }
 
@@ -1026,7 +1026,8 @@ static int create_geo_pfxs_vis(bvc_t *consumer) {
         country_strings[i] = (const char *)strdup(newstr);
     }
 
-    if (init_iso2_map(consumer, STATE->countries, country_strings) < 0) {
+    if (init_iso2_map(consumer, STATE->countries, country_strings,
+            country_cnt) < 0) {
         ret = -1;
     }
 
