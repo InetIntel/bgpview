@@ -66,6 +66,11 @@ CONSUMER_SRCS += \
 	bvc_pergeovisibility.c \
 	bvc_pergeovisibility.h
 
+# Per-Geo Visibility Consumer, using ipinfo (depends on Visibility)
+CONSUMER_SRCS += \
+	bvc_pergeovisibility_ipinfo.c \
+	bvc_pergeovisibility_ipinfo.h
+
 # Announced Prefixes Consumer (depends on Visibility)
 CONSUMER_SRCS += \
 	bvc_announcedpfxs.c \

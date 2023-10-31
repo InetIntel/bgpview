@@ -252,8 +252,6 @@ typedef struct pfx_location {
 
     uint64_t addr_run_cnt;
     uint64_t addr_run_size;
-    uint64_t addr6_pfx_cnt;
-    uint64_t addr6_pfx_size;
 } pfx_location_t;
 
 typedef struct perpfx_cache {
@@ -455,15 +453,8 @@ static bgpstream_ipv6_pfx_set_t *update_ip6_prefix(
     newpfx.bs_ipv6.address.addr.s6_addr[6] = (cur_address >> 8) & 0xFF;
     newpfx.bs_ipv6.address.addr.s6_addr[7] = (cur_address & 0xFF);
 
-    if (loc->addr6_pfx_size == loc->addr6_pfx_cnt) {
-        loc->addr6_pfxs = realloc(loc->addr6_pfxs,
-                sizeof(bgpstream_ipv6_pfx_set_t *) *
-                    (loc->addr6_pfx_size + 10));
-        if (loc->addr6_pfxs == NULL) {
-            fprintf(stderr, "OOM inside update_ip6_prefix() \n");
-            return NULL;
-        }
-        loc->addr6_pfx_size += 10;
+    if (loc->addr6_pfxs == NULL) {
+        loc->addr6_pfxs = bgpstream_ipv6_pfx_set_create();
     }
 
     /* Use bgpstream_ipv6_pfx_set_insert() to add to the prefix set */
@@ -604,7 +595,7 @@ static void add_geo_v6pfx_to_tree(bgpstream_pfx_t *pfx, void *userdata) {
 }
 
 static int per_geo_update_v6(bvc_t *consumer, per_geo_t *pg,
-                bgpstream_pfx_t *pfx, bgpstream_ipv6_pfx_set_t *pfx_set) {
+                bgpstream_pfx_t *pfx, pfx_location_t *loc) {
 
     uint32_t num_slash24s, offset = 0;
     int idx = bgpstream_ipv2idx(pfx->address.version);
@@ -636,7 +627,8 @@ static int per_geo_update_v6(bvc_t *consumer, per_geo_t *pg,
                         STATE->origin_asns[j]);
             }
 
-            if (bgpstream_ipv6_pfx_set_iterate(pfx_set, add_geo_v6pfx_to_tree,
+            if (bgpstream_ipv6_pfx_set_iterate(loc->addr6_pfxs,
+                        add_geo_v6pfx_to_tree,
                         (void *) &(pg->thresholds[i])) < 0) {
                 return -1;
             }
@@ -647,7 +639,8 @@ static int per_geo_update_v6(bvc_t *consumer, per_geo_t *pg,
 }
 
 static int per_geo_update(bvc_t *consumer, per_geo_t *pg, bgpstream_pfx_t *pfx,
-                          ip_addr_run_t *runs, uint64_t num_runs, int index) {
+        pfx_location_t *loc) {
+
     uint32_t num_slash24s, offset = 0;
     int idx = bgpstream_ipv2idx(pfx->address.version);
     /* number of full feed ASNs for the current IP version*/
@@ -680,15 +673,16 @@ static int per_geo_update(bvc_t *consumer, per_geo_t *pg, bgpstream_pfx_t *pfx,
             /* "Explode" each run into a series of /24 or /64 networks and
              * add them to the set.
              */
-            for (j = 0; j < num_runs; j++) {
+            for (j = 0; j < loc->addr_run_cnt; j++) {
                 /* Determine the offset to the beginning of the /24. */
-                offset = runs[j].network_addr & 0x000000ff;
+                offset = loc->addr_runs[j].network_addr & 0x000000ff;
                 /* Round up to the next-highest number of /24 */
-                num_slash24s = (runs[j].num_ips + offset + 255) / 256;
+                num_slash24s = (loc->addr_runs[j].num_ips + offset + 255) / 256;
 
                 for (k = 0; k < num_slash24s; k++) {
                     slash24_id_set_insert(pg->thresholds[i].slash24s,
-                            (runs[j].network_addr & 0xffffff00) + (k << 8));
+                            (loc->addr_runs[j].network_addr & 0xffffff00) +
+                                    (k << 8));
                 }
             }
             break;
@@ -838,10 +832,77 @@ static int init_ipmeta(bvc_t *consumer) {
     return 0;
 }
 
+static void clear_iso2_map(khash_t(iso2_map) *map) {
+    khint_t k;
+    per_geo_t *pg;
+
+    for (k = kh_begin(map); k != kh_end(map); ++k) {
+        if (!kh_exist(map, k)) {
+            continue;
+        }
+        pg = (per_geo_t *)kh_value(map, k);
+        per_geo_destroy(pg);
+    }
+
+    kh_destroy(iso2_map, map);
+}
+
+static void clear_name_map(khash_t(name_map) *map) {
+    khint_t k;
+    per_geo_t *pg;
+
+    for (k = kh_begin(map); k != kh_end(map); ++k) {
+        if (!kh_exist(map, k)) {
+            continue;
+        }
+        pg = (per_geo_t *)kh_value(map, k);
+        per_geo_destroy(pg);
+    }
+
+    kh_destroy(name_map, map);
+}
+
+static void clear_iso2_runs(khash_t(iso2_runs) *map) {
+    khint_t k;
+    pfx_location_t *loc;
+
+    for (k = kh_begin(map); k != kh_end(map); ++k) {
+        if (!kh_exist(map, k)) {
+            continue;
+        }
+        loc = (pfx_location_t *)kh_value(map, k);
+        bgpstream_ipv6_pfx_set_destroy(loc->addr6_pfxs);
+        free(loc->addr_runs);
+        free(loc);
+    }
+    kh_destroy(iso2_runs, map);
+}
+
+static void clear_name_runs(khash_t(name_runs) *map) {
+    khint_t k;
+    pfx_location_t *loc;
+
+    for (k = kh_begin(map); k != kh_end(map); ++k) {
+        if (!kh_exist(map, k)) {
+            continue;
+        }
+        loc = (pfx_location_t *)kh_value(map, k);
+        bgpstream_ipv6_pfx_set_destroy(loc->addr6_pfxs);
+        free(loc->addr_runs);
+        free(loc);
+    }
+    kh_destroy(name_runs, map);
+}
+
 static void destroy_ipmeta(bvc_t *consumer) {
     int i, j;
 
-    /* TODO empty continents, countries, regions, cities maps */
+    /* empty continents, countries, regions, cities maps */
+    clear_iso2_map(STATE->continents);
+    clear_iso2_map(STATE->countries);
+    clear_name_map(STATE->regions);
+    clear_name_map(STATE->cities);
+
     if (STATE->ipmeta != NULL) {
         ipmeta_free(STATE->ipmeta);
         STATE->ipmeta = NULL;
@@ -886,6 +947,17 @@ static int reload_ipmeta(bvc_t *consumer, bgpview_t *view) {
     return 0;
 }
 
+static void destroy_pfx_user_ptr(void *user) {
+    perpfx_cache_t *pfx_cache = (perpfx_cache_t *)user;
+
+    clear_iso2_runs(pfx_cache->continents);
+    clear_iso2_runs(pfx_cache->countries);
+    clear_name_runs(pfx_cache->regions);
+    clear_name_runs(pfx_cache->cities);
+
+    free(pfx_cache);
+}
+
 static int clear_geocache(bvc_t *consumer, bgpview_t *view) {
     bgpview_iter_t *it = bgpview_iter_create(view);
     assert(it != NULL);
@@ -901,7 +973,64 @@ static int clear_geocache(bvc_t *consumer, bgpview_t *view) {
     return 0;
 }
 
+static void init_name_map(khash_t(name_map) *map, const char **names) {
+
+    int i, ret;
+    per_geo_t *pg;
+    khint_t k;
+
+    for (i = 0; i < ARR_CNT(names); i++) {
+        k = kh_put(name_map, map, names[i], &ret);
+        if (ret == 0) {
+            fprintf(stderr, "WARNING: duplicate geolocation name: %s\n",
+                    names[i]);
+            continue;
+        }
+        pg = calloc(1, sizeof(per_geo_t));
+        METRIC_PREFIX_INIT(pg, METRIC_PATH, names[i]);
+
+        kh_value(map, k) = pg;
+    }
+}
+
+static void init_iso2_map(khash_t(iso2_map) *map, const char **iso2codes) {
+
+    int i, len, ret;
+    per_geo_t *pg;
+    char *ptr;
+    khint_t k;
+
+    for (i = 0; i < ARR_CNT(iso2codes); i++) {
+        uint16_t key;
+        len = strlen(iso2codes[i]);
+
+        if (len < 2) {
+            continue;
+        } else {
+            ptr = iso2codes[i] + (len - 2);
+            key = CC_16(ptr);
+        }
+
+        k = kh_put(iso2_map, map, key, &ret);
+        if (ret == 0) {
+            fprintf(stderr, "WARNING: duplicate geolocation name: %s\n",
+                    iso2codes[i]);
+            continue;
+        }
+        pg = calloc(1, sizeof(per_geo_t));
+        METRIC_PREFIX_INIT(pg, METRIC_PATH, iso2codes[i]);
+
+        kh_value(map, k) = pg;
+    }
+}
+
 static int create_geo_pfxs_vis(bvc_t *consumer) {
+
+    int country_cnt = 0, i;
+    const char **countries_iso2 = NULL;
+    const char **country_continents = NULL;
+
+    const char **country_strings = NULL;
 
     STATE->continents = kh_init(iso2_map);
     STATE->countries = kh_init(iso2_map);
@@ -911,7 +1040,29 @@ static int create_geo_pfxs_vis(bvc_t *consumer) {
     /* TODO insert initialized per_geo_t entries for each known
      * continent, region, country...
      */
+    init_iso2_map(STATE->continents, continent_strings);
 
+    country_cnt = ipmeta_provider_maxmind_get_iso2_list(&countries_iso2);
+    if (ipmeta_provider_maxmind_get_country_continent_list(&country_continents) != country_cnt) {
+        fprintf(stderr, "ERROR: not all ISO2 country codes in libipmeta have a corresponding continent code?\n");
+        return -1;
+    }
+
+    country_strings = calloc(country_cnt, sizeof(char *));
+
+    for (i = 0; i < country_cnt; i++) {
+        char newstr[32];
+        snprintf(newstr, 32, "%s.%s", country_continents[i], countries_iso2[i]);
+
+        country_strings[i] = (const char *)strdup(newstr);
+    }
+
+    init_iso2_map(STATE->countries, country_strings);
+
+    for (i = 0; i < country_cnt; i++) {
+        free(country_strings[i]);
+    }
+    free(country_strings);
     return 0;
 }
 
@@ -1007,6 +1158,19 @@ static int update_pfx(bvc_t *consumer, bgpstream_pfx_t *pfx,
         }
 
         /* country */
+        loc = lookup_iso2(&(pfx_cache->countries),
+                (const char *)rec->country_code);
+        if (loc != NULL) {
+            if (pfx->address.version == BGPSTREAM_ADDR_VERSION_IPV6 &&
+                    update_ip6_prefix(loc, cur_addr, num_ips) == NULL) {
+                return -1;
+            } else if (pfx->address.version == BGPSTREAM_ADDR_VERSION_IPV4 &&
+                    update_ip_addr_run(loc, cur_addr, num_ips) == NULL) {
+                return -1;
+            }
+        }
+
+        /* TODO */
 
         /* region */
 
@@ -1016,6 +1180,80 @@ static int update_pfx(bvc_t *consumer, bgpstream_pfx_t *pfx,
         (*iptally) += num_ips;
 
     }
+    return 0;
+}
+
+static int update_pfx_geo_named(bvc_t *consumer, khash_t(name_map) *aggs,
+        khash_t(name_runs) *cached, bgpstream_pfx_t *pfx) {
+
+    per_geo_t *pg;
+    pfx_location_t *loc;
+    khint_t k, k2;
+
+    for (k = kh_begin(cached); k != kh_end(cached); ++k) {
+
+        if (!kh_exist(cached, k)) {
+            continue;
+        }
+        loc = (pfx_location_t *)kh_value(cached, k);
+
+        k2 = kh_get(name_map, aggs, kh_key(cached, k));
+
+        if (k2 == kh_end(aggs)) {
+            fprintf(stderr, "ERROR: Named location %04x is present in pfx_cache, but not in main aggregation map?\n", kh_key(cached, k));
+            return -1;
+        }
+
+        pg = (per_geo_t *)kh_value(aggs, k2);
+
+        if (pfx->address.version == BGPSTREAM_ADDR_VERSION_IPV4) {
+            if (per_geo_update(consumer, pg, pfx, loc) != 0) {
+                return -1;
+            }
+        } else {
+            if (per_geo_update_v6(consumer, pg, pfx, loc) != 0) {
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int update_pfx_geo_iso2(bvc_t *consumer, khash_t(iso2_map) *aggs,
+        khash_t(iso2_runs) *cached, bgpstream_pfx_t *pfx) {
+
+    per_geo_t *pg;
+    pfx_location_t *loc;
+    khint_t k, k2;
+
+    for (k = kh_begin(cached); k != kh_end(cached); ++k) {
+
+        if (!kh_exist(cached, k)) {
+            continue;
+        }
+        loc = (pfx_location_t *)kh_value(cached, k);
+
+        k2 = kh_get(iso2_map, aggs, kh_key(cached, k));
+
+        if (k2 == kh_end(aggs)) {
+            fprintf(stderr, "ERROR: ISO2 code %04x is present in pfx_cache, but not in main aggregation map?\n", kh_key(cached, k));
+            return -1;
+        }
+
+        pg = (per_geo_t *)kh_value(aggs, k2);
+
+        if (pfx->address.version == BGPSTREAM_ADDR_VERSION_IPV4) {
+            if (per_geo_update(consumer, pg, pfx, loc) != 0) {
+                return -1;
+            }
+        } else {
+            if (per_geo_update_v6(consumer, pg, pfx, loc) != 0) {
+                return -1;
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -1055,8 +1293,16 @@ static int update_pfx_geo_information(bvc_t *consumer, bgpview_iter_t *it) {
      * aggregate (continents, countries, polygons)  TODO */
 
     /* continents */
+    if (update_pfx_geo_iso2(consumer, STATE->continents, pfx_cache->continents,
+            pfx) < 0) {
+        return -1;
+    }
 
     /* countries */
+    if (update_pfx_geo_iso2(consumer, STATE->countries, pfx_cache->countries,
+            pfx) < 0) {
+        return -1;
+    }
 
     /* regions */
 
@@ -1123,7 +1369,7 @@ static int compute_geo_pfx_visibility(bvc_t *consumer, bgpview_iter_t *it) {
     return 0;
 }
 
-static int update_per_geo_metrics(bvc_t *consumer, per_geo_t *pg, int index)
+static int update_per_geo_metrics(bvc_t *consumer, per_geo_t *pg)
 {
     int i;
     int v4ind, v6ind;
@@ -1195,14 +1441,33 @@ static int update_per_geo_metrics(bvc_t *consumer, per_geo_t *pg, int index)
     return 0;
 }
 
+static int update_metrics_iso2(bvc_t *consumer, khash_t(iso2_map) *map) {
+    khint_t k;
+    per_geo_t *pg;
+
+    for (k = kh_begin(map); k != kh_end(map); ++k) {
+        if (!kh_exist(map, k)) {
+            continue;
+        }
+        pg = (per_geo_t *)kh_value(map, k);
+        if (update_per_geo_metrics(consumer, pg) < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
 
 static int update_metrics(bvc_t *consumer) {
 
     /* for each continent */
-    /* TODO iterate over STATE->continents and update_per_geo_metrics() */
+    if (update_metrics_iso2(consumer, STATE->continents) < 0) {
+        return -1;
+    }
 
     /* for each country */
-    /* TODO iterate over STATE->counties and update_per_geo_metrics() */
+    if (update_metrics_iso2(consumer, STATE->countries) < 0) {
+        return -1;
+    }
 
     /* for each region */
     /* TODO iterate over STATE->regions and update_per_geo_metrics() */
