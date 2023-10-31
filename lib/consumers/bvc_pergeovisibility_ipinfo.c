@@ -127,12 +127,6 @@ typedef struct slash24_id_set {
   khash_t(slash24_id_set) * hash;
 } slash24_id_set_t;
 
-KHASH_MAP_INIT_STR(name_map, per_geo_t)
-KHASH_MAP_INIT_INT(iso2_map, per_geo_t)
-
-KHASH_MAP_INIT_INT(iso2_runs, pfx_location_t);
-KHASH_MAP_INIT_STR(name_runs, pfx_location_t);
-
 /* creates a metric:
  * [CHAIN_STATE->metric_prefix].prefix-visibility.[geopfx].[geofmt]
  */
@@ -154,7 +148,7 @@ KHASH_MAP_INIT_STR(name_runs, pfx_location_t);
     idx = timeseries_kp_add_key(STATE->kp, key_buffer);                        \
   } while (0)
 
-#define STATE (BVC_GET_STATE(consumer, pergeovisibility))
+#define STATE (BVC_GET_STATE(consumer, pergeovisibility_ipinfo))
 
 #define CHAIN_STATE (BVC_GET_CHAIN_STATE(consumer))
 
@@ -254,11 +248,17 @@ typedef struct pfx_location {
     uint64_t addr_run_size;
 } pfx_location_t;
 
+KHASH_MAP_INIT_STR(name_map, per_geo_t *)
+KHASH_MAP_INIT_INT(iso2_map, per_geo_t *)
+
+KHASH_MAP_INIT_INT(iso2_runs, pfx_location_t *);
+KHASH_MAP_INIT_STR(name_runs, pfx_location_t *);
+
 typedef struct perpfx_cache {
-    khash_t(iso2_runs) continents;
-    khash_t(iso2_runs) countries;
-    khash_t(name_runs) regions;
-    khash_t(name_runs) cities;
+    khash_t(iso2_runs) *continents;
+    khash_t(iso2_runs) *countries;
+    khash_t(name_runs) *regions;
+    khash_t(name_runs) *cities;
 
 } perpfx_cache_t;
 
@@ -294,6 +294,9 @@ typedef struct bvc_pergeovisibility_state {
     int arrival_delay_idx;
     int processed_delay_idx;
     int processing_time_idx;
+
+    int reload_freq;
+    uint32_t last_reload;
 
 } bvc_pergeovisibility_ipinfo_state_t;
 
@@ -488,7 +491,7 @@ static ip_addr_run_t *update_ip_addr_run(pfx_location_t *loc,
     }
 
     assert(loc->addr_run_cnt > 0);
-    run = &(addr_runs[loc->addr_run_cnt - 1]);
+    run = &(loc->addr_runs[loc->addr_run_cnt - 1]);
     assert(run->network_addr != cur_address);
 
     /* We are dealing with a continuation of a past run.  All we need to do is
@@ -914,6 +917,133 @@ static void destroy_ipmeta(bvc_t *consumer) {
     }
 }
 
+static int clear_geocache(bvc_t *consumer, bgpview_t *view) {
+    bgpview_iter_t *it = bgpview_iter_create(view);
+    assert(it != NULL);
+
+    for (bgpview_iter_first_pfx(it, 0, BGPVIEW_FIELD_ALL_VALID); //
+            bgpview_iter_has_more_pfx(it);                    //
+            bgpview_iter_next_pfx(it)) {
+        // will call the destroy func itself
+        bgpview_iter_pfx_set_user(it, NULL);
+    }
+
+    bgpview_iter_destroy(it);
+    return 0;
+}
+
+static int init_name_map(bvc_t *consumer, khash_t(name_map) *map,
+        const char **names) {
+
+    int i, ret;
+    per_geo_t *pg;
+    khint_t k;
+
+    for (i = 0; i < ARR_CNT(names); i++) {
+        k = kh_put(name_map, map, names[i], &ret);
+        if (ret == 0) {
+            fprintf(stderr, "WARNING: duplicate geolocation name: %s\n",
+                    names[i]);
+            continue;
+        }
+        pg = calloc(1, sizeof(per_geo_t));
+        METRIC_PREFIX_INIT(pg, METRIC_PATH, names[i]);
+
+        kh_value(map, k) = pg;
+    }
+    return 0;
+err:
+    return -1;
+}
+
+static int init_iso2_map(bvc_t *consumer, khash_t(iso2_map) *map,
+        const char **iso2codes) {
+
+    int i, len, ret;
+    per_geo_t *pg;
+    char *ptr;
+    khint_t k;
+
+    for (i = 0; i < ARR_CNT(iso2codes); i++) {
+        uint16_t key;
+        len = strlen(iso2codes[i]);
+
+        if (len < 2) {
+            continue;
+        } else {
+            ptr = iso2codes[i] + (len - 2);
+            key = CC_16(ptr);
+        }
+
+        k = kh_put(iso2_map, map, key, &ret);
+        if (ret == 0) {
+            fprintf(stderr, "WARNING: duplicate geolocation name: %s\n",
+                    iso2codes[i]);
+            continue;
+        }
+        pg = calloc(1, sizeof(per_geo_t));
+        METRIC_PREFIX_INIT(pg, METRIC_PATH, iso2codes[i]);
+
+        kh_value(map, k) = pg;
+    }
+    return 0;
+err:
+    return -1;
+}
+
+static int create_geo_pfxs_vis(bvc_t *consumer) {
+
+    int country_cnt = 0, i, ret;
+    const char **countries_iso2 = NULL;
+    const char **country_continents = NULL;
+
+    const char **country_strings = NULL;
+
+    STATE->continents = kh_init(iso2_map);
+    STATE->countries = kh_init(iso2_map);
+    STATE->regions = kh_init(name_map);
+    STATE->cities = kh_init(name_map);
+
+    /* TODO insert initialized per_geo_t entries for each known
+     * continent, region, country...
+     */
+    if (init_iso2_map(consumer, STATE->continents, continent_strings) < 0) {
+        return -1;
+    }
+
+    country_cnt = ipmeta_provider_maxmind_get_iso2_list(&countries_iso2);
+    if (ipmeta_provider_maxmind_get_country_continent_list(&country_continents) != country_cnt) {
+        fprintf(stderr, "ERROR: not all ISO2 country codes in libipmeta have a corresponding continent code?\n");
+        return -1;
+    }
+
+    country_strings = calloc(country_cnt, sizeof(char *));
+
+    for (i = 0; i < country_cnt; i++) {
+        char newstr[32];
+        snprintf(newstr, 32, "%s.%s", country_continents[i], countries_iso2[i]);
+
+        country_strings[i] = (const char *)strdup(newstr);
+    }
+
+    if (init_iso2_map(consumer, STATE->countries, country_strings) < 0) {
+        ret = -1;
+    }
+
+    for (i = 0; i < country_cnt; i++) {
+        free((void *)country_strings[i]);
+    }
+    free(country_strings);
+
+    if (ret == -1) {
+        return ret;
+    }
+
+
+    return 0;
+}
+
+
 static int reload_ipmeta(bvc_t *consumer, bgpview_t *view) {
 
     fprintf(stderr, "INFO: reloading libipmeta (after %"PRIu32" seconds)\n",
@@ -973,99 +1103,6 @@ static int clear_geocache(bvc_t *consumer, bgpview_t *view) {
     return 0;
 }
 
-static void init_name_map(khash_t(name_map) *map, const char **names) {
-
-    int i, ret;
-    per_geo_t *pg;
-    khint_t k;
-
-    for (i = 0; i < ARR_CNT(names); i++) {
-        k = kh_put(name_map, map, names[i], &ret);
-        if (ret == 0) {
-            fprintf(stderr, "WARNING: duplicate geolocation name: %s\n",
-                    names[i]);
-            continue;
-        }
-        pg = calloc(1, sizeof(per_geo_t));
-        METRIC_PREFIX_INIT(pg, METRIC_PATH, names[i]);
-
-        kh_value(map, k) = pg;
-    }
-}
-
-static void init_iso2_map(khash_t(iso2_map) *map, const char **iso2codes) {
-
-    int i, len, ret;
-    per_geo_t *pg;
-    char *ptr;
-    khint_t k;
-
-    for (i = 0; i < ARR_CNT(iso2codes); i++) {
-        uint16_t key;
-        len = strlen(iso2codes[i]);
-
-        if (len < 2) {
-            continue;
-        } else {
-            ptr = iso2codes[i] + (len - 2);
-            key = CC_16(ptr);
-        }
-
-        k = kh_put(iso2_map, map, key, &ret);
-        if (ret == 0) {
-            fprintf(stderr, "WARNING: duplicate geolocation name: %s\n",
-                    iso2codes[i]);
-            continue;
-        }
-        pg = calloc(1, sizeof(per_geo_t));
-        METRIC_PREFIX_INIT(pg, METRIC_PATH, iso2codes[i]);
-
-        kh_value(map, k) = pg;
-    }
-}
-
-static int create_geo_pfxs_vis(bvc_t *consumer) {
-
-    int country_cnt = 0, i;
-    const char **countries_iso2 = NULL;
-    const char **country_continents = NULL;
-
-    const char **country_strings = NULL;
-
-    STATE->continents = kh_init(iso2_map);
-    STATE->countries = kh_init(iso2_map);
-    STATE->regions = kh_init(name_map);
-    STATE->cities = kh_init(name_map);
-
-    /* TODO insert initialized per_geo_t entries for each known
-     * continent, region, country...
-     */
-    init_iso2_map(STATE->continents, continent_strings);
-
-    country_cnt = ipmeta_provider_maxmind_get_iso2_list(&countries_iso2);
-    if (ipmeta_provider_maxmind_get_country_continent_list(&country_continents) != country_cnt) {
-        fprintf(stderr, "ERROR: not all ISO2 country codes in libipmeta have a corresponding continent code?\n");
-        return -1;
-    }
-
-    country_strings = calloc(country_cnt, sizeof(char *));
-
-    for (i = 0; i < country_cnt; i++) {
-        char newstr[32];
-        snprintf(newstr, 32, "%s.%s", country_continents[i], countries_iso2[i]);
-
-        country_strings[i] = (const char *)strdup(newstr);
-    }
-
-    init_iso2_map(STATE->countries, country_strings);
-
-    for (i = 0; i < country_cnt; i++) {
-        free(country_strings[i]);
-    }
-    free(country_strings);
-    return 0;
-}
-
 static pfx_location_t *lookup_iso2(khash_t(iso2_runs) **map,
         const char *iso2) {
 
@@ -1093,14 +1130,14 @@ static pfx_location_t *lookup_iso2(khash_t(iso2_runs) **map,
     return loc;
 }
 
-static pfx_location_t *lookup_named(khash_t(iso2_runs) **map,
+static pfx_location_t *lookup_named(khash_t(name_runs) **map,
         const char *name) {
 
     khint_t k;
     int ret;
     pfx_location_t *loc = NULL;
 
-    if (*iso2 == '\0') {
+    if (*name == '\0') {
         return NULL;
     }
 
@@ -1120,7 +1157,7 @@ static pfx_location_t *lookup_named(khash_t(iso2_runs) **map,
 static int update_pfx(bvc_t *consumer, bgpstream_pfx_t *pfx,
                 perpfx_cache_t *pfx_cache, uint64_t *iptally) {
     uint64_t num_ips = 0;
-    uint64_t cur_address = first_pfx_addr(pfx);
+    uint64_t cur_addr = first_pfx_addr(pfx);
     ipmeta_record_t *rec = NULL;
     int poly_table;
 
@@ -1262,7 +1299,6 @@ static int update_pfx_geo_information(bvc_t *consumer, bgpview_iter_t *it) {
     perpfx_cache_t *pfx_cache = (perpfx_cache_t *)bgpview_iter_pfx_get_user(it);
 
     uint64_t num_ips = 0;
-    uint64_t cur_address = first_pfx_addr(pfx);
     ipmeta_record_t *rec = NULL;
 
     int r;
@@ -1542,7 +1578,6 @@ err:
 }
 
 void bvc_pergeovisibility_ipinfo_destroy(bvc_t *consumer) {
-{
     if (STATE == NULL) {
         return;
     }
