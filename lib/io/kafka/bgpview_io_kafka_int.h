@@ -178,10 +178,15 @@ typedef struct gc_topics {
   int view_state; /* WORKER_VIEW_EMPTY, WORKER_VIEW_READY */
 
   /** The peer topic for this member */
-  bgpview_io_kafka_topic_t peers;
+  rd_kafka_topic_partition_list_t *peers;
 
   /** The prefix topic for this member */
-  bgpview_io_kafka_topic_t pfxs;
+  rd_kafka_topic_partition_list_t *pfxs;
+
+  /** Name of the peer topic for this member */
+  char *peer_tname;
+  /** Name of the prefix topic for this member */
+  char *pfx_tname;
 
   /** Mapping of remote to local peer IDs */
   bgpview_io_kafka_peeridmap_t idmap;
@@ -201,6 +206,8 @@ KHASH_INIT(str_topic, char *, gc_topics_t *, 1, kh_str_hash_func,
 typedef struct global_consumer_state {
 
   khash_t(str_topic) * topics;
+
+  char *brokers;
 
 #ifdef WITH_THREADS
   /** Global view mutex */

@@ -71,7 +71,7 @@ static void kafka_error_callback(rd_kafka_t *rk, int err, const char *reason,
 
 static void free_gc_topics(gc_topics_t *gct)
 {
-  fprintf(stderr, "INFO: Destroying state for %s\n", gct->pfxs.name);
+  fprintf(stderr, "INFO: Destroying state for %s\n", gct->pfx_tname);
 #ifdef WITH_THREADS
   /* clean up the worker thread */
   gct->shutdown = 1;
@@ -86,13 +86,16 @@ static void free_gc_topics(gc_topics_t *gct)
   gct->idmap.map = NULL;
   gct->idmap.alloc_cnt = 0;
 
-  if (gct->peers.rkt != NULL) {
-    rd_kafka_topic_destroy(gct->peers.rkt);
-    gct->peers.rkt = NULL;
+  rd_kafka_topic_partition_list_destroy(gct->peers);
+  rd_kafka_topic_partition_list_destroy(gct->pfxs);
+  if (gct->pfx_tname) {
+    free(gct->pfx_tname);
   }
-  if (gct->pfxs.rkt != NULL) {
-    rd_kafka_topic_destroy(gct->pfxs.rkt);
-    gct->pfxs.rkt = NULL;
+  if (gct->peer_tname) {
+    free(gct->peer_tname);
+  }
+  if (gct->rdk_conn) {
+    rd_kafka_destroy(gct->rdk_conn);
   }
 
   free(gct);
@@ -348,6 +351,7 @@ bgpview_io_kafka_t *bgpview_io_kafka_init(bgpview_io_kafka_mode_t mode,
     if ((client->gc_state.topics = kh_init(str_topic)) == NULL) {
       goto err;
     }
+    client->gc_state.brokers = strdup(client->brokers);
 #ifdef WITH_THREADS
     pthread_mutex_init(&client->gc_state.mutex, NULL);
 #endif
@@ -413,6 +417,9 @@ void bgpview_io_kafka_destroy(bgpview_io_kafka_t *client)
       kh_free(str_topic, client->gc_state.topics, (void (*)(char *))free);
       kh_destroy(str_topic, client->gc_state.topics);
       client->gc_state.topics = NULL;
+    }
+    if (client->gc_state.brokers) {
+      free(client->gc_state.brokers);
     }
 #ifdef WITH_THREADS
     pthread_mutex_destroy(&client->gc_state.mutex);

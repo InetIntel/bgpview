@@ -148,6 +148,56 @@ static int seek_topic(rd_kafka_t *rdk_conn, rd_kafka_topic_t *rkt,
   return 0;
 }
 
+static rd_kafka_t *create_rdk_sub_connection(char *brokers) {
+  rd_kafka_conf_t *conf = rd_kafka_conf_new();
+  rd_kafka_t *rdk = NULL;
+
+  char errstr[512];
+
+  if (rd_kafka_conf_set(conf, "queued.min.messages", "100", errstr,
+                        sizeof(errstr)) != RD_KAFKA_CONF_OK) {
+    fprintf(stderr, "ERROR: %s\n", errstr);
+    goto err;
+  }
+
+  if (rd_kafka_conf_set(conf, "group.id", "bgpview-dev", errstr,
+                        sizeof(errstr)) != RD_KAFKA_CONF_OK) {
+    fprintf(stderr, "ERROR: %s\n", errstr);
+    goto err;
+  }
+  
+  if (rd_kafka_conf_set(conf, "api.version.request", "true", errstr,
+                        sizeof(errstr)) != RD_KAFKA_CONF_OK) {
+    fprintf(stderr, "ERROR: %s\n", errstr);
+    goto err;
+  }
+
+  if (rd_kafka_conf_set(conf, "bootstrap.servers", brokers, errstr,
+                        sizeof(errstr)) != RD_KAFKA_CONF_OK) {
+    fprintf(stderr, "ERROR: %s\n", errstr);
+    goto err;
+  }
+
+
+
+  // Create Kafka handle
+  if ((rdk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr,
+                                       sizeof(errstr))) == NULL) {
+    fprintf(stderr, "ERROR: Failed to create new consumer: %s\n", errstr);
+    goto err;
+  }
+
+  // poll for connection errors
+  rd_kafka_poll(rdk, 10);
+  return rdk;
+
+err:
+  if (rdk) {
+    rd_kafka_destroy(rdk);
+  }
+  return NULL;
+}
+
 static int deserialize_metadata(bgpview_io_kafka_md_t *meta, uint8_t *buf,
                                 size_t len)
 {
@@ -478,17 +528,16 @@ err:
   return -1;
 }
 
-static int recv_peers(bgpview_io_kafka_peeridmap_t *idmap,
-                      bgpview_io_kafka_topic_t *topic, bgpview_iter_t *iter,
-                      bgpview_io_filter_peer_cb_t *peer_cb, int64_t offset,
-                      uint32_t exp_time, rd_kafka_t *rdk_conn
+static int process_peers_message(rd_kafka_message_t *msg,
+		bgpview_io_kafka_peeridmap_t *idmap,
+		bgpview_iter_t *iter, bgpview_io_filter_peer_cb_t *peer_cb,
+	        uint32_t exp_time, int *peers_rx
 #ifdef WITH_THREADS
                       ,
                       pthread_mutex_t *mutex
 #endif
-                      )
-{
-  rd_kafka_message_t *msg = NULL;
+		) {
+
   size_t read = 0;
   ssize_t s;
   uint8_t *ptr;
@@ -499,8 +548,150 @@ static int recv_peers(bgpview_io_kafka_peeridmap_t *idmap,
   bgpstream_peer_id_t peerid_remote;
   bgpstream_peer_sig_t ps;
 
-  int peers_rx = 0;
   int filter;
+
+  ptr  = msg->payload;
+  read = 0;
+
+  BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, type);
+
+  if (type == 'E') {
+    /* end of peers */
+    BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, vtime);
+    assert(vtime == exp_time);
+    BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, peer_cnt);
+    assert(*peers_rx == peer_cnt);
+
+    return 0;
+  }
+
+  assert(type == 'P');
+
+  if ((s = bgpview_io_deserialize_peer(ptr, msg->len, &peerid_remote, &ps)) <
+      0) {
+    return -1;
+  }
+  read += s;
+  ptr += s;
+
+  (*peers_rx)++;
+
+  if (iter == NULL) {
+    return 1;
+  }
+
+  if (peer_cb != NULL) {
+    /* ask the caller if they want this peer */
+    if ((filter = peer_cb(&ps)) < 0) {
+      return -1;
+    }
+    if (filter == 0) {
+      return 1;
+    }
+  }
+  /* all code below here has a valid view */
+  if (add_peerid_mapping(idmap, iter, &ps, peerid_remote
+#ifdef WITH_THREADS
+                           ,
+                           mutex
+#endif
+                           ) <= 0) {
+    return -1;
+  }
+  return 1;
+}
+
+static int recv_peers(bgpview_io_kafka_peeridmap_t *idmap, const char *tname,
+		rd_kafka_topic_partition_list_t *topic, bgpview_iter_t *iter,
+                      bgpview_io_filter_peer_cb_t *peer_cb, int64_t offset,
+                      uint32_t exp_time, rd_kafka_t *rdk_conn
+#ifdef WITH_THREADS
+                      ,
+                      pthread_mutex_t *mutex
+#endif
+                      )
+{
+
+  rd_kafka_message_t *msg = NULL;
+  int r, peers_rx = 0;
+  int seeked = 0;
+  rd_kafka_resp_err_t err;
+  if ((err = rd_kafka_topic_partition_list_set_offset(topic, tname, 0,
+      offset)) != 0) {
+    fprintf(stderr, "partition list set offset failed for %s -- %s\n",
+		    tname, rd_kafka_err2str(err));
+    goto err;
+  } 
+
+  if ((err = rd_kafka_assign(rdk_conn, topic)) != 0) {
+    fprintf(stderr, "rd_kafka_assign failed for %s -- %s\n",
+		    tname, rd_kafka_err2str(err));
+    goto err;
+  }
+
+  /* receive the peers */
+  while (1) {
+    msg = rd_kafka_consumer_poll(rdk_conn, 5000);
+    if (msg == NULL) {
+      continue;
+    }
+    if (msg->err == RD_KAFKA_RESP_ERR__PARTITION_EOF) {
+      rd_kafka_message_destroy(msg);
+      continue;
+    }
+    if (msg->err != 0) {
+      /* TODO: handle this failure -- maybe reconnect? */
+      fprintf(stderr, "ERROR: Could not consume peers message (err %d: %s)\n",
+              msg->err, rd_kafka_message_errstr(msg));
+      rd_kafka_message_destroy(msg);
+      goto err;
+    }
+    if (seeked == 0) {
+      assert(msg->offset == offset);
+      seeked = 1;
+    }
+
+    r = process_peers_message(msg, idmap, iter, peer_cb, exp_time, &peers_rx
+#ifdef WITH_THREADS
+		   , mutex
+#endif
+		   );
+    if (r < 0) {
+      goto err;
+    }
+    rd_kafka_message_destroy(msg);
+    msg = NULL;
+
+    if (r == 0) {
+      break;
+    }
+
+  }
+
+  rd_kafka_assign(rdk_conn, NULL);
+  assert(msg == NULL);
+  return 0;
+
+err:
+  if (msg != NULL) {
+    rd_kafka_message_destroy(msg);
+  }
+  rd_kafka_assign(rdk_conn, NULL);
+  return -1;
+}
+
+static int recv_peers_topic(bgpview_io_kafka_peeridmap_t *idmap,
+                      bgpview_io_kafka_topic_t *topic, bgpview_iter_t *iter,
+                      bgpview_io_filter_peer_cb_t *peer_cb, int64_t offset,
+                      uint32_t exp_time, rd_kafka_t *rdk_conn
+#ifdef WITH_THREADS
+                      ,
+                      pthread_mutex_t *mutex
+#endif
+                      )
+{
+  rd_kafka_message_t *msg = NULL;
+  int r, peers_rx = 0;
 
   if (seek_topic(rdk_conn, topic->rkt, BGPVIEW_IO_KAFKA_PEERS_PARTITION_DEFAULT,
                  offset) != 0) {
@@ -513,59 +704,19 @@ static int recv_peers(bgpview_io_kafka_peeridmap_t *idmap,
                            5000, "peer");
     if (msg == NULL)
       goto err;
-    ptr = msg->payload;
-    read = 0;
-
-    BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, type);
-
-    if (type == 'E') {
-      /* end of peers */
-      BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, vtime);
-      assert(vtime == exp_time);
-      BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, peer_cnt);
-      assert(peers_rx == peer_cnt);
-
-      rd_kafka_message_destroy(msg);
-      msg = NULL;
-      break;
-    }
-
-    assert(type == 'P');
-
-    if ((s = bgpview_io_deserialize_peer(ptr, msg->len, &peerid_remote, &ps)) <
-        0) {
+    r = process_peers_message(msg, idmap, iter, peer_cb, exp_time, &peers_rx
+#ifdef WITH_THREADS
+		   , mutex
+#endif
+		   );
+    if (r < 0) {
       goto err;
     }
-    read += s;
-    ptr += s;
-
     rd_kafka_message_destroy(msg);
     msg = NULL;
 
-    peers_rx++;
-
-    if (iter == NULL) {
-      continue;
-    }
-
-    if (peer_cb != NULL) {
-      /* ask the caller if they want this peer */
-      if ((filter = peer_cb(&ps)) < 0) {
-        goto err;
-      }
-      if (filter == 0) {
-        continue;
-      }
-    }
-    /* all code below here has a valid view */
-
-    if (add_peerid_mapping(idmap, iter, &ps, peerid_remote
-#ifdef WITH_THREADS
-                           ,
-                           mutex
-#endif
-                           ) <= 0) {
-      goto err;
+    if (r == 0) {
+      break;
     }
   }
 
@@ -579,7 +730,200 @@ err:
   return -1;
 }
 
-static int recv_pfxs(bgpview_io_kafka_peeridmap_t *idmap,
+static int process_pfx_message(rd_kafka_message_t *msg,
+		bgpview_io_kafka_peeridmap_t *idmap,
+		bgpview_iter_t *iter, bgpview_t *view,
+		bgpview_io_filter_pfx_cb_t *pfx_cb,
+		bgpview_io_filter_pfx_peer_cb_t *pfx_peer_cb,
+		uint32_t exp_time, int *pfx_rx, const char *topicname
+#ifdef WITH_THREADS
+		, pthread_mutex_t *mutex
+#endif
+		) {
+
+  uint32_t view_time;
+
+  size_t read = 0;
+  uint8_t *ptr;
+  ssize_t s;
+
+  char type;
+
+  uint32_t pfx_cnt = 0;
+
+  int tor = 0;
+  int tom = 0;
+
+  ptr = msg->payload;
+  read = 0;
+
+  BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, type);
+
+  if (type == 'E') {
+    /* end of prefixes */
+    BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, view_time);
+    if (iter != NULL) {
+      bgpview_set_time(view, view_time);
+    }
+    BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, pfx_cnt);
+    fprintf(stderr, "DEBUG: %s   Time: %" PRIu32 "\n", topicname, view_time);
+    fprintf(stderr, "DEBUG: pfx_cnt: %" PRIu32 ", pfx_rx: %" PRIu32 "\n",
+            pfx_cnt, *pfx_rx);
+
+    assert(view_time == exp_time);
+    if (*pfx_rx != pfx_cnt || read != msg->len) {
+      fprintf(stderr, "WARN: Invalid prefix table received from %s\n",
+              topicname);
+      return -1;
+    }
+
+    return 0;
+  }
+
+#ifdef WITH_THREADS
+  if (mutex != NULL) {
+    pthread_mutex_lock(mutex);
+  }
+#endif
+
+  /* if it is not an 'END' message, then it can contain many prefix row
+     messages */
+  while (read < msg->len) {
+    /* this is a prefix row message */
+    (*pfx_rx)++;
+
+    switch (type) {
+    /* a sync row*/
+    case 'S':
+    case 'U':
+      /* an update row */
+      tom++;
+      if ((s = bgpview_io_deserialize_pfx_row(
+             ptr, (msg->len - read), iter, pfx_cb, pfx_peer_cb, idmap->map,
+             idmap->alloc_cnt, NULL, -1, BGPVIEW_FIELD_ACTIVE)) == -1) {
+#ifdef WITH_THREADS
+        if (mutex != NULL) {
+          pthread_mutex_unlock(mutex);
+        }
+#endif
+        return -1;
+      }
+      read += s;
+      ptr += s;
+      break;
+
+    case 'R':
+      /* a remove row */
+      tor++;
+      if ((s = bgpview_io_deserialize_pfx_row(
+             ptr, (msg->len - read), iter, pfx_cb, pfx_peer_cb, idmap->map,
+             idmap->alloc_cnt, NULL, -1, BGPVIEW_FIELD_INACTIVE)) == -1) {
+#ifdef WITH_THREADS
+        if (mutex != NULL) {
+          pthread_mutex_unlock(mutex);
+        }
+#endif
+        return -1;
+      }
+      read += s;
+      ptr += s;
+      break;
+
+    default:
+      assert(0);
+    }
+
+    /* read the type of the next row */
+    if (read < msg->len) {
+      BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, type);
+    }
+  }
+
+#ifdef WITH_THREADS
+  if (mutex != NULL) {
+    pthread_mutex_unlock(mutex);
+  }
+#endif
+
+  assert(read == msg->len);
+  return 1;
+}
+
+static int recv_pfxs(bgpview_io_kafka_peeridmap_t *idmap, const char *tname,
+                     rd_kafka_topic_partition_list_t *topic,
+		     bgpview_iter_t *iter,
+                     bgpview_io_filter_pfx_cb_t *pfx_cb,
+                     bgpview_io_filter_pfx_peer_cb_t *pfx_peer_cb,
+                     int64_t offset, uint32_t exp_time, rd_kafka_t *rdk_conn
+#ifdef WITH_THREADS
+                     ,
+                     pthread_mutex_t *mutex
+#endif
+                     )
+{
+  bgpview_t *view = NULL;
+  int pfx_rx = 0, r, seeked=0;
+  rd_kafka_message_t *msg = NULL;
+
+  fprintf(stderr, "DEBUG: seek %s to %" PRIi64 "\n", tname, offset);
+
+  if (rd_kafka_topic_partition_list_set_offset(topic, tname, 0, offset) != 0) {
+    goto err;
+  } 
+
+  if (rd_kafka_assign(rdk_conn, topic) != 0) {
+    goto err;
+  }
+
+  if (iter != NULL) {
+    view = bgpview_iter_get_view(iter);
+  }
+  
+  /* receive the peers */
+  while (1) {
+    msg = rd_kafka_consumer_poll(rdk_conn, 5000);
+
+    if (msg == NULL)
+      goto err;
+    if (msg->err == RD_KAFKA_RESP_ERR__PARTITION_EOF) {
+      rd_kafka_message_destroy(msg);
+      continue;
+    }
+    if (msg->err != 0) {
+      /* TODO: handle this failure -- maybe reconnect? */
+      fprintf(stderr, "ERROR: Could not consume peers message (err %d: %s)\n",
+              msg->err, rd_kafka_message_errstr(msg));
+      goto err;
+    }
+    if (seeked == 0) {
+      assert(msg->offset == offset);
+      seeked = 1;
+    }
+
+    r = process_pfx_message(msg, idmap, iter, view, pfx_cb, pfx_peer_cb, 
+		    exp_time, &pfx_rx, tname, mutex);
+    if (r < 0) {
+      fprintf(stderr, "failed to process pfx message\n");
+      goto err;
+    }
+    rd_kafka_message_destroy(msg);
+    msg = NULL;
+    if (r == 0) {
+      break;
+    }
+  }
+
+  assert(msg == NULL);
+  return 0;
+
+err:
+  if (msg != NULL) {
+    rd_kafka_message_destroy(msg);
+  }
+  return -1;
+}
+
+static int recv_pfxs_topic(bgpview_io_kafka_peeridmap_t *idmap,
                      bgpview_io_kafka_topic_t *topic, bgpview_iter_t *iter,
                      bgpview_io_filter_pfx_cb_t *pfx_cb,
                      bgpview_io_filter_pfx_peer_cb_t *pfx_peer_cb,
@@ -591,20 +935,7 @@ static int recv_pfxs(bgpview_io_kafka_peeridmap_t *idmap,
                      )
 {
   bgpview_t *view = NULL;
-  uint32_t view_time;
-
-  size_t read = 0;
-  uint8_t *ptr;
-  ssize_t s;
-
-  char type;
-
-  uint32_t pfx_cnt = 0;
-  int pfx_rx = 0;
-
-  int tor = 0;
-  int tom = 0;
-
+  int pfx_rx = 0, r;
   rd_kafka_message_t *msg = NULL;
 
   fprintf(stderr, "DEBUG: seek %s to %" PRIi64 "\n", topic->name, offset);
@@ -618,112 +949,22 @@ static int recv_pfxs(bgpview_io_kafka_peeridmap_t *idmap,
     view = bgpview_iter_get_view(iter);
   }
 
-  int msg_cnt = 0;
-
   while (1) {
     msg = bvio_kafka_consume(topic->rkt, BGPVIEW_IO_KAFKA_PFXS_PARTITION_DEFAULT,
                            5000, "prefix");
     if (msg == NULL)
       goto err;
-    msg_cnt++;
 
-    ptr = msg->payload;
-    read = 0;
-
-    BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, type);
-
-    if (type == 'E') {
-      /* end of prefixes */
-      BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, view_time);
-      if (iter != NULL) {
-        bgpview_set_time(view, view_time);
-      }
-      assert(view_time == exp_time);
-      BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, pfx_cnt);
-      fprintf(stderr, "DEBUG: Time: %" PRIu32 "\n", view_time);
-      fprintf(stderr, "DEBUG: MSG CNT %s: %d\n", topic->name, msg_cnt);
-      fprintf(stderr, "DEBUG: pfx_cnt: %" PRIu32 ", pfx_rx: %" PRIu32 "\n",
-              pfx_cnt, pfx_rx);
-
-      if (pfx_rx != pfx_cnt || read != msg->len) {
-        fprintf(stderr, "WARN: Invalid prefix table received from %s\n",
-                topic->name);
-        goto err;
-      }
-
-      rd_kafka_message_destroy(msg);
-      msg = NULL;
-      break;
+    r = process_pfx_message(msg, idmap, iter, view, pfx_cb, pfx_peer_cb, 
+		    exp_time, &pfx_rx, topic->name, mutex);
+    if (r < 0) {
+      goto err;
     }
-
-#ifdef WITH_THREADS
-    if (mutex != NULL) {
-      pthread_mutex_lock(mutex);
-    }
-#endif
-
-    /* if it is not an 'END' message, then it can contain many prefix row
-       messages */
-    while (read < msg->len) {
-      /* this is a prefix row message */
-      pfx_rx++;
-
-      switch (type) {
-      /* a sync row*/
-      case 'S':
-      case 'U':
-        /* an update row */
-        tom++;
-        if ((s = bgpview_io_deserialize_pfx_row(
-               ptr, (msg->len - read), iter, pfx_cb, pfx_peer_cb, idmap->map,
-               idmap->alloc_cnt, NULL, -1, BGPVIEW_FIELD_ACTIVE)) == -1) {
-#ifdef WITH_THREADS
-          if (mutex != NULL) {
-            pthread_mutex_unlock(mutex);
-          }
-#endif
-          goto err;
-        }
-        read += s;
-        ptr += s;
-        break;
-
-      case 'R':
-        /* a remove row */
-        tor++;
-        if ((s = bgpview_io_deserialize_pfx_row(
-               ptr, (msg->len - read), iter, pfx_cb, pfx_peer_cb, idmap->map,
-               idmap->alloc_cnt, NULL, -1, BGPVIEW_FIELD_INACTIVE)) == -1) {
-#ifdef WITH_THREADS
-          if (mutex != NULL) {
-            pthread_mutex_unlock(mutex);
-          }
-#endif
-          goto err;
-        }
-        read += s;
-        ptr += s;
-        break;
-
-      default:
-        assert(0);
-      }
-
-      /* read the type of the next row */
-      if (read < msg->len) {
-        BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, type);
-      }
-    }
-
-#ifdef WITH_THREADS
-    if (mutex != NULL) {
-      pthread_mutex_unlock(mutex);
-    }
-#endif
-
-    assert(read == msg->len);
     rd_kafka_message_destroy(msg);
     msg = NULL;
+    if (r == 0) {
+      break;
+    }
   }
 
   assert(msg == NULL);
@@ -735,6 +976,53 @@ err:
   }
   return -1;
 }
+
+static int recv_view_new(gc_topics_t *gct) {
+
+  bgpview_iter_t *it = NULL;
+
+  if (gct->view != NULL && (it = bgpview_iter_create(gct->view)) == NULL) {
+    fprintf(stderr, "could not create bgpview iterator\n");
+    return -1;
+  }
+
+  if (recv_peers(&(gct->idmap), gct->peer_tname, gct->peers, it, gct->peer_cb,
+		 gct->meta->peers_offset, gct->meta->time, gct->rdk_conn
+#ifdef WITH_THREADS
+                 ,
+                 &(gct->global->mutex)
+#endif
+                 ) < 0) {
+    goto err;
+  }
+
+  if (recv_pfxs(&(gct->idmap), gct->pfx_tname, gct->pfxs, it, gct->pfx_cb,
+		gct->pfx_peer_cb, gct->meta->pfxs_offset, gct->meta->time,
+		gct->rdk_conn
+#ifdef WITH_THREADS
+                ,
+                &(gct->global->mutex)
+#endif
+                ) < 0) {
+    goto err;
+  }
+
+  if (it != NULL) {
+    bgpview_iter_destroy(it);
+  }
+
+  return 0;
+
+err:
+  if (it != NULL) {
+    bgpview_iter_destroy(it);
+  }
+  return -1;
+
+}
+
+
+
 
 static int recv_view(bgpview_io_kafka_peeridmap_t *idmap, bgpview_t *view,
                      bgpview_io_kafka_md_t *meta,
@@ -756,7 +1044,7 @@ static int recv_view(bgpview_io_kafka_peeridmap_t *idmap, bgpview_t *view,
     return -1;
   }
 
-  if (recv_peers(idmap, peers_topic, it, peer_cb, meta->peers_offset,
+  if (recv_peers_topic(idmap, peers_topic, it, peer_cb, meta->peers_offset,
                  meta->time, rdk_conn
 #ifdef WITH_THREADS
                  ,
@@ -766,8 +1054,8 @@ static int recv_view(bgpview_io_kafka_peeridmap_t *idmap, bgpview_t *view,
     goto err;
   }
 
-  if (recv_pfxs(idmap, pfxs_topic, it, pfx_cb, pfx_peer_cb, meta->pfxs_offset,
-                meta->time, rdk_conn
+  if (recv_pfxs_topic(idmap, pfxs_topic, it, pfx_cb, pfx_peer_cb,
+		meta->pfxs_offset, meta->time, rdk_conn
 #ifdef WITH_THREADS
                 ,
                 mutex
@@ -794,6 +1082,12 @@ static void *thread_worker(void *user)
 {
   gc_topics_t *gct = (gc_topics_t *)user;
 
+  gct->rdk_conn = create_rdk_sub_connection(gct->global->brokers);
+  if (gct->rdk_conn == NULL) {
+    fprintf(stderr, "Could not connect to kafka in worker thread for %s\n",
+		gct->pfx_tname);
+    gct->shutdown = 1;
+  }
   pthread_mutex_lock(&gct->mutex);
   while (gct->shutdown == 0) {
     /* signal that we are ready to do some work */
@@ -817,9 +1111,7 @@ static void *thread_worker(void *user)
 
     /* do some work! */
     /* ask to read each view */
-    if (recv_view(&gct->idmap, gct->view, gct->meta, &gct->peers, &gct->pfxs,
-                  gct->peer_cb, gct->pfx_cb, gct->pfx_peer_cb, gct->rdk_conn,
-                  &gct->global->mutex) != 0) {
+    if (recv_view_new(gct) != 0) {
       pthread_mutex_lock(&gct->mutex);
       gct->recv_error = 1;
       pthread_mutex_unlock(&gct->mutex);
@@ -884,6 +1176,7 @@ static gc_topics_t *get_gc_topics(bgpview_io_kafka_t *client, char *identity)
   /* is there already a record for this identity? */
   if ((k = kh_get(str_topic, client->gc_state.topics, identity)) ==
       kh_end(client->gc_state.topics)) {
+    char topicname[IDENTITY_MAX_LEN];
     /* need to create the topic and insert into the hash */
     cpy = strdup(identity);
     assert(cpy != NULL);
@@ -893,6 +1186,21 @@ static gc_topics_t *get_gc_topics(bgpview_io_kafka_t *client, char *identity)
     }
     kh_val(client->gc_state.topics, k) = gct;
 
+    snprintf(topicname, IDENTITY_MAX_LEN, "%s.%s.%s",
+		                          client->namespace,
+					  identity, "peers");
+    gct->peers = rd_kafka_topic_partition_list_new(1);
+    rd_kafka_topic_partition_list_add(gct->peers, topicname, 0);
+    gct->peer_tname = strdup(topicname);
+
+    snprintf(topicname, IDENTITY_MAX_LEN, "%s.%s.%s",
+		                          client->namespace,
+					  identity, "pfxs");
+    gct->pfx_tname = strdup(topicname);
+    gct->pfxs = rd_kafka_topic_partition_list_new(1);
+    rd_kafka_topic_partition_list_add(gct->pfxs, topicname, 0);
+
+/*
     if (bgpview_io_kafka_single_topic_connect(client, identity,
                                               BGPVIEW_IO_KAFKA_TOPIC_ID_PEERS,
                                               &gct->peers) != 0) {
@@ -902,13 +1210,13 @@ static gc_topics_t *get_gc_topics(bgpview_io_kafka_t *client, char *identity)
           client, identity, BGPVIEW_IO_KAFKA_TOPIC_ID_PFXS, &gct->pfxs) != 0) {
       goto err;
     }
+*/
     gct->job_state = WORKER_JOB_IDLE;
     gct->view_state = WORKER_VIEW_EMPTY;
-
+    gct->recv_error = 0;
 #ifdef WITH_THREADS
-    gct->rdk_conn = client->rdk_conn;
     gct->global = &client->gc_state;
-
+	
     gct->worker_state = WORKER_BUSY;
 
     /* spin up the worker thread */
@@ -942,7 +1250,7 @@ static gc_topics_t *get_gc_topics(bgpview_io_kafka_t *client, char *identity)
     gct = kh_val(client->gc_state.topics, k);
   }
 
-  fprintf(stderr, "DEBUG: RKT Name: %s\n", gct->pfxs.name);
+  fprintf(stderr, "DEBUG: RKT Name: %s\n", gct->pfx_tname);
 
   return gct;
 
@@ -1028,7 +1336,7 @@ static int recv_global_view(bgpview_io_kafka_t *client, bgpview_t *view,
     pthread_mutex_unlock(&gct->mutex);
     fprintf(stderr, "DEBUG: assigned job to %s\n", metas[i].identity);
 #else
-    if (recv_view(&gct->idmap, gct->view, &metas[i], &gct->peers, &gct->pfxs,
+    if (recv_view_new(&gct->idmap, gct->view, &metas[i], gct->peers, gct->pfxs,
                   peer_cb, pfx_cb, pfx_peer_cb, client->rdk_conn) != 0) {
       fprintf(stderr, "WARN: Failed to receive view for %s, skipping\n",
               metas[i].identity);
@@ -1060,7 +1368,7 @@ static int recv_global_view(bgpview_io_kafka_t *client, bgpview_t *view,
     /* gct->metas cannot be used */
 
     fprintf(stderr, "DEBUG: checking whether %s should be disabled\n",
-            gct->pfxs.name);
+            gct->pfx_tname);
 
 #ifdef WITH_THREADS
     pthread_mutex_lock(&gct->mutex);
@@ -1073,7 +1381,7 @@ static int recv_global_view(bgpview_io_kafka_t *client, bgpview_t *view,
       /* if not using threads, then we're done with this worker */
       gct->job_state = WORKER_JOB_IDLE;
 #endif
-      fprintf(stderr, "DEBUG: not disabling busy worker %s\n", gct->pfxs.name);
+      fprintf(stderr, "DEBUG: not disabling busy worker %s\n", gct->pfx_tname);
       continue;
     }
 #ifdef WITH_THREADS
@@ -1168,6 +1476,14 @@ int bgpview_io_kafka_consumer_connect(bgpview_io_kafka_t *client)
     fprintf(stderr, "ERROR: %s\n", errstr);
     goto err;
   }
+
+  /*
+  if (rd_kafka_conf_set(conf, "group.id", "bgpview-dev", errstr,
+                        sizeof(errstr)) != RD_KAFKA_CONF_OK) {
+    fprintf(stderr, "ERROR: %s\n", errstr);
+    goto err;
+  }
+  */
 
   // Create Kafka handle
   if ((client->rdk_conn = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr,
