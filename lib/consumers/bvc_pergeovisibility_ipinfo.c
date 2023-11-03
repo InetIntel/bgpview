@@ -503,13 +503,14 @@ static ip_addr_run_t *update_ip_addr_run(pfx_location_t *loc,
          * We have to add a new ip_addr_run_t data structure and populate it.
          */
     } else {
-        if (loc->addr_run_cnt == loc->addr_run_size) {
+        while (loc->addr_run_cnt >= loc->addr_run_size) {
             loc->addr_runs = realloc(loc->addr_runs,
                     sizeof(ip_addr_run_t) * (loc->addr_run_size + 10));
             if (loc->addr_runs == NULL) {
                 fprintf(stderr, "OOM inside update_ip_addr_run() \n");
                 return NULL;
             }
+	    loc->addr_run_size += 10;
         }
         loc->addr_run_cnt ++;
 
