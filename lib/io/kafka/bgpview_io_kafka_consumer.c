@@ -148,7 +148,7 @@ static int seek_topic(rd_kafka_t *rdk_conn, rd_kafka_topic_t *rkt,
   return 0;
 }
 
-static rd_kafka_t *create_rdk_sub_connection(char *brokers) {
+static rd_kafka_t *create_rdk_sub_connection(char *brokers, char *group) {
   rd_kafka_conf_t *conf = rd_kafka_conf_new();
   rd_kafka_t *rdk = NULL;
 
@@ -160,7 +160,7 @@ static rd_kafka_t *create_rdk_sub_connection(char *brokers) {
     goto err;
   }
 
-  if (rd_kafka_conf_set(conf, "group.id", "bgpview-dev", errstr,
+  if (rd_kafka_conf_set(conf, "group.id", group, errstr,
                         sizeof(errstr)) != RD_KAFKA_CONF_OK) {
     fprintf(stderr, "ERROR: %s\n", errstr);
     goto err;
@@ -1082,7 +1082,8 @@ static void *thread_worker(void *user)
 {
   gc_topics_t *gct = (gc_topics_t *)user;
 
-  gct->rdk_conn = create_rdk_sub_connection(gct->global->brokers);
+  gct->rdk_conn = create_rdk_sub_connection(gct->global->brokers,
+		  gct->global->consumer_group);
   if (gct->rdk_conn == NULL) {
     fprintf(stderr, "Could not connect to kafka in worker thread for %s\n",
 		gct->pfx_tname);

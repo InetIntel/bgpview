@@ -146,6 +146,8 @@ static void usage(void)
     "%s)\n"
     "       -c <channel>          Global metadata channel to use (default: "
     "unused)\n",
+    "       -g <group>            Consumer group to use (mandatory for global "
+    "view consumers)\n"
     BGPVIEW_IO_KAFKA_BROKER_URI_DEFAULT, BGPVIEW_IO_KAFKA_NAMESPACE_DEFAULT);
 }
 
@@ -157,7 +159,7 @@ static int parse_args(bgpview_io_kafka_t *client, int argc, char **argv)
   optind = 1;
 
   /* remember the argv strings DO NOT belong to us */
-  while ((opt = getopt(argc, argv, ":c:i:k:n:?")) >= 0) {
+  while ((opt = getopt(argc, argv, ":c:i:k:n:g:?")) >= 0) {
     switch (opt) {
     case 'c':
       client->channel = strdup(optarg);
@@ -177,6 +179,10 @@ static int parse_args(bgpview_io_kafka_t *client, int argc, char **argv)
       if (bgpview_io_kafka_set_namespace(client, optarg) != 0) {
         return -1;
       }
+      break;
+    
+    case 'g':
+      client->consumer_group = strdup(optarg);
       break;
 
     case '?':
@@ -348,10 +354,17 @@ bgpview_io_kafka_t *bgpview_io_kafka_init(bgpview_io_kafka_mode_t mode,
   }
 
   if (client->mode == BGPVIEW_IO_KAFKA_MODE_GLOBAL_CONSUMER) {
+    if (client->consumer_group == NULL) {
+      fprintf(stderr,
+	    "ERROR: consumer group must be set for global consumer\n");
+      usage();
+      goto err;
+    }
     if ((client->gc_state.topics = kh_init(str_topic)) == NULL) {
       goto err;
     }
     client->gc_state.brokers = strdup(client->brokers);
+    client->gc_state.consumer_group = strdup(client->consumer_group);
 #ifdef WITH_THREADS
     pthread_mutex_init(&client->gc_state.mutex, NULL);
 #endif
@@ -395,6 +408,11 @@ void bgpview_io_kafka_destroy(bgpview_io_kafka_t *client)
   free(client->identity);
   client->identity = NULL;
 
+  if (client->consumer_group) {
+    free(client->consumer_group);
+    client->consumer_group = NULL;
+  }
+
   free(client->namespace);
   client->namespace = NULL;
 
@@ -420,6 +438,9 @@ void bgpview_io_kafka_destroy(bgpview_io_kafka_t *client)
     }
     if (client->gc_state.brokers) {
       free(client->gc_state.brokers);
+    }
+    if (client->gc_state.consumer_group) {
+      free(client->gc_state.consumer_group);
     }
 #ifdef WITH_THREADS
     pthread_mutex_destroy(&client->gc_state.mutex);

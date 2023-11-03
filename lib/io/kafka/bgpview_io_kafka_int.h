@@ -209,6 +209,8 @@ typedef struct global_consumer_state {
 
   char *brokers;
 
+  char *consumer_group;
+
 #ifdef WITH_THREADS
   /** Global view mutex */
   pthread_mutex_t mutex;
@@ -239,6 +241,9 @@ struct bgpview_io_kafka {
   /** Global meta channel to use (to allow multiple global meta servers to be
       run) */
   char *channel;
+
+  /** The consumer group to use for this instance (if a consumer) */
+  char *consumer_group;
 
   /* STATE */
 
