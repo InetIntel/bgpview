@@ -1145,23 +1145,30 @@ static int update_pfx(bvc_t *consumer, bgpstream_pfx_t *pfx,
     uint64_t num_ips = 0;
     uint64_t cur_addr = first_pfx_addr(pfx);
     ipmeta_record_t *rec = NULL;
-    int poly_table;
+    int num_recs;
+    char tolookup[INET6_ADDRSTRLEN + 6];
+
 
     /* Perform lookup */
     ipmeta_record_set_clear(STATE->records);
-
-    if (pfx->address.version == BGPSTREAM_ADDR_VERSION_IPV6) {
-        ipmeta_lookup_pfx(STATE->ipmeta, AF_INET6,
-                (void *)(&(pfx->address.bs_ipv6.addr.s6_addr)),
-                pfx->mask_len, 0, STATE->records);
-    } else if (pfx->address.version == BGPSTREAM_ADDR_VERSION_IPV4) {
-         ipmeta_lookup_pfx(STATE->ipmeta, AF_INET,
-                (void *)(&(pfx->address.bs_ipv4.addr.s_addr)),
-                pfx->mask_len, 0, STATE->records);
-    } else {
-        return 0;
+    if (bgpstream_pfx_snprintf(tolookup, INET6_ADDRSTRLEN + 6, pfx) == NULL) {
+        fprintf(stderr,
+                "ERROR: unable to convert bgpstream prefix to string\n");
+        return -1;
     }
 
+    num_recs = ipmeta_lookup_using_provider(STATE->ipmeta,
+            tolookup, STATE->provider, STATE->records);
+
+    if (num_recs < 0) {
+        fprintf(stderr,
+                "ERROR: ipmeta error while looking up prefix %s\n",
+                tolookup);
+        return -1;
+    }
+    if (num_recs == 0) {
+        return 0;
+    }
     ipmeta_record_set_rewind(STATE->records);
 
     while ((rec = ipmeta_record_set_next(STATE->records, &num_ips))) {
@@ -1203,7 +1210,7 @@ static int update_pfx(bvc_t *consumer, bgpstream_pfx_t *pfx,
         (*iptally) += num_ips;
 
     }
-    return 0;
+    return 1;
 }
 
 static int update_pfx_geo_named(bvc_t *consumer, khash_t(name_map) *aggs,
@@ -1300,7 +1307,6 @@ static int update_pfx_geo_information(bvc_t *consumer, bgpview_iter_t *it) {
         pfx_cache->countries = kh_init(iso2_runs);
         pfx_cache->regions = kh_init(name_runs);
         pfx_cache->cities = kh_init(name_runs);
-
         if ((r = update_pfx(consumer, pfx, pfx_cache, &num_ips)) < 0) {
             return -1;
         }
@@ -1325,7 +1331,6 @@ static int update_pfx_geo_information(bvc_t *consumer, bgpview_iter_t *it) {
             pfx) < 0) {
         return -1;
     }
-
     /* regions */
 
     /* cities */
