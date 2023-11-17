@@ -67,7 +67,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-
+#define _GNU_SOURCE
 #include "bgpview_consumer_interface.h"
 #include "bvc_pergeovisibility_ipinfo.h"
 #include "bgpstream_utils_pfx_set.h"
@@ -81,6 +81,10 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <math.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
 
 #define NAME "per-geo-visibility-ipinfo"
 #define METRIC_PREFIX "prefix-visibility"
@@ -262,6 +266,42 @@ typedef struct perpfx_cache {
 
 } perpfx_cache_t;
 
+typedef struct ipmeta_worker {
+    int read_pipe;
+    int write_pipe;
+
+    char *provider_config;
+    char *provider_name;
+    char *provider_arg;
+
+    ipmeta_t *ipmeta;
+    ipmeta_provider_t *provider;
+    ipmeta_record_set_t *records;
+
+    int workerid;
+    pthread_t pthreadid;
+
+    bvc_t *parent;
+} ipmeta_worker_t;
+
+enum {
+    IPMETA_JOB_HALT,
+    IPMETA_JOB_LOOKUP
+};
+
+typedef struct ipmeta_job {
+    uint8_t jobtype;
+    bgpstream_pfx_t *pfx;
+    perpfx_cache_t *cache;
+} ipmeta_job_t;
+
+typedef struct ipmeta_result {
+    int workerid;
+    int result;
+    bgpstream_pfx_t *pfx;
+    perpfx_cache_t *cache;
+} ipmeta_result_t;
+
 /* our 'instance' */
 typedef struct bvc_pergeovisibility_state {
 
@@ -270,9 +310,13 @@ typedef struct bvc_pergeovisibility_state {
     char *provider_name;
     char *provider_arg;
 
-    ipmeta_t *ipmeta;
-    ipmeta_provider_t *provider;
-    ipmeta_record_set_t *records;
+    int worker_count;
+    ipmeta_worker_t *workers;
+    int *worker_job_queues;
+    int *worker_res_queues;
+    int *worker_jobs_outstanding;
+    int next_worker;
+    int max_resfd;
 
     khash_t(iso2_map) *continents;
     khash_t(iso2_map) *countries;
@@ -295,9 +339,6 @@ typedef struct bvc_pergeovisibility_state {
     int processed_delay_idx;
     int processing_time_idx;
 
-    int reload_freq;
-    uint32_t last_reload;
-
 } bvc_pergeovisibility_ipinfo_state_t;
 
 /* ==================== PARSE ARGS FUNCTIONS ==================== */
@@ -305,7 +346,8 @@ typedef struct bvc_pergeovisibility_state {
 /** Print usage information to stderr */
 static void usage(bvc_t *consumer)
 {
-    fprintf(stderr, "consumer usage: %s -p <ipmeta-provider>\n",
+    fprintf(stderr,
+            "consumer usage: %s -c <worker count> -p <ipmeta-provider>\n",
             consumer->name);
 }
 
@@ -314,13 +356,13 @@ static int parse_args(bvc_t *consumer, int argc, char **argv) {
     assert(argc > 0 && argv != NULL);
 
     optind = 1;
-    while ((opt = getopt(argc, argv, ":p:r:?")) >= 0) {
+    while ((opt = getopt(argc, argv, ":p:c:?")) >= 0) {
         switch(opt) {
+            case 'c':
+                STATE->worker_count = atoi(optarg);
+                break;
             case 'p':
                 STATE->provider_config = strdup(optarg);
-                break;
-            case 'r':
-                STATE->reload_freq = atoi(optarg);
                 break;
             case '?':
             case ':':
@@ -425,6 +467,7 @@ static void slash24_id_set_destroy(slash24_id_set_t *set)
     kh_destroy(slash24_id_set, set->hash);
     free(set);
 }
+
 
 /* ==================== PER-GEO-INFO FUNCTIONS ==================== */
 
@@ -777,59 +820,67 @@ static int init_kp(bvc_t *consumer)
     return 0;
 }
 
-static int init_ipmeta(bvc_t *consumer) {
+static int init_ipmeta(ipmeta_worker_t *worker) {
     /* initialize ipmeta structure */
-    if ((STATE->ipmeta = ipmeta_init(IPMETA_DS_PATRICIA)) == NULL) {
-        fprintf(stderr, "Error: Could not initialize ipmeta \n");
+    if ((worker->ipmeta = ipmeta_init(IPMETA_DS_PATRICIA)) == NULL) {
+        fprintf(stderr, "Error: worker %d ould not initialize ipmeta \n",
+                worker->workerid);
         return -1;
     }
 
-    if (STATE->provider_name == NULL) {
+    if (worker->provider_name == NULL) {
         /* need to parse the string given by the user */
-        assert(STATE->provider_arg == NULL);
-        STATE->provider_name = STATE->provider_config;
+        assert(worker->provider_arg == NULL);
+        worker->provider_name = worker->provider_config;
 
         /* the string at STATE->provider_config will contain the name of the
          * plugin, optionally followed by a space and then the arguments to
          * pass to the plugin */
-        if ((STATE->provider_arg = strchr(STATE->provider_config, ' '))
+        if ((worker->provider_arg = strchr(worker->provider_config, ' '))
                 != NULL) {
             /* set the space to a nul, which allows STATE->provider_configs[i]
              * to be used for the provider name, and then increment
              * plugin_arg_ptr to point to the next character, which will be
              * the start of the arg string (or at worst case, the
              * terminating \0) */
-            *STATE->provider_arg = '\0';
-            STATE->provider_arg++;
+            *worker->provider_arg = '\0';
+            worker->provider_arg++;
         }
     }
     /* lookup the provider using the name given  */
-    if ((STATE->provider = ipmeta_get_provider_by_name(
-                    STATE->ipmeta, STATE->provider_name)) == NULL) {
-        fprintf(stderr, "ERROR: Invalid provider name: %s\n",
-                STATE->provider_name);
+    if ((worker->provider = ipmeta_get_provider_by_name(
+                    worker->ipmeta, worker->provider_name)) == NULL) {
+        if (worker->workerid == 0) {
+            fprintf(stderr, "ERROR: Invalid provider name: %s\n",
+                    worker->provider_name);
+        }
         return -1;
     }
 
     /* we only support ipinfo or the memcache-psql provider */
-    if (ipmeta_get_provider_id(STATE->provider) != IPMETA_PROVIDER_IPINFO &&
-            ipmeta_get_provider_id(STATE->provider) !=
+    if (ipmeta_get_provider_id(worker->provider) != IPMETA_PROVIDER_IPINFO &&
+            ipmeta_get_provider_id(worker->provider) !=
                     IPMETA_PROVIDER_MEMCACHE_PSQL) {
-        fprintf(stderr,
-                "ERROR: Only IPInfo-compliant providers (ipinfo, memcache_psql) are currently supported\n");
+        if (worker->workerid == 0) {
+            fprintf(stderr,
+                    "ERROR: Only IPInfo-compliant providers (ipinfo, memcache_psql) are currently supported\n");
+        }
         return -1;
     }
 
-    if (ipmeta_enable_provider(STATE->ipmeta, STATE->provider,
-                STATE->provider_arg) != 0) {
-        fprintf(stderr, "ERROR: Could not enable provider %s\n",
-                STATE->provider_config);
+    if (ipmeta_enable_provider(worker->ipmeta, worker->provider,
+                worker->provider_arg) != 0) {
+        if (worker->workerid == 0) {
+            fprintf(stderr, "ERROR: Could not enable provider %s\n",
+                    worker->provider_config);
+        }
         return -1;
     }
 
     /* initialize a (reusable) record set structure  */
-    if ((STATE->records = ipmeta_record_set_init()) == NULL) {
-        fprintf(stderr, "ERROR: Could not init record set\n");
+    if ((worker->records = ipmeta_record_set_init()) == NULL) {
+        fprintf(stderr, "ERROR: Worker %d could not init record set\n",
+                worker->workerid);
         return -1;
     }
 
@@ -896,26 +947,6 @@ static void clear_name_runs(khash_t(name_runs) *map) {
         free(loc);
     }
     kh_destroy(name_runs, map);
-}
-
-static void destroy_ipmeta(bvc_t *consumer) {
-    int i, j;
-
-    /* empty continents, countries, regions, cities maps */
-    clear_iso2_map(STATE->continents);
-    clear_iso2_map(STATE->countries);
-    clear_name_map(STATE->regions);
-    clear_name_map(STATE->cities);
-
-    if (STATE->ipmeta != NULL) {
-        ipmeta_free(STATE->ipmeta);
-        STATE->ipmeta = NULL;
-    }
-
-    if (STATE->records != NULL) {
-        ipmeta_record_set_free(&STATE->records);
-        STATE->records = NULL;
-    }
 }
 
 static int clear_geocache(bvc_t *consumer, bgpview_t *view) {
@@ -1045,40 +1076,6 @@ static int create_geo_pfxs_vis(bvc_t *consumer) {
     return 0;
 }
 
-
-static int reload_ipmeta(bvc_t *consumer, bgpview_t *view) {
-
-    fprintf(stderr, "INFO: reloading libipmeta (after %"PRIu32" seconds)\n",
-            (bgpview_get_time(view) - STATE->last_reload));
-    /* clear our cache */
-    clear_geocache(consumer, view);
-
-    /* shut down our existing ipmeta instance */
-    destroy_ipmeta(consumer);
-
-    /* create a new key package */
-    timeseries_kp_free(&STATE->kp);
-    if (init_kp(consumer) != 0) {
-        fprintf(stderr, "ERROR: Could not re-initialize the timeseries KP\n");
-        return -1;
-    }
-
-    /* restart ipmeta */
-    if (init_ipmeta(consumer) != 0) {
-        fprintf(stderr, "ERROR: Could not restart ipmeta\n");
-        return -1;
-    }
-
-    /* recreate other ipmeta state */
-    if (create_geo_pfxs_vis(consumer) != 0) {
-        fprintf(stderr, "ERROR: Could not rebuild ipmeta lookup tables\n");
-        return -1;
-    }
-
-    STATE->last_reload = bgpview_get_time(view);
-    return 0;
-}
-
 static void destroy_pfx_user_ptr(void *user) {
     perpfx_cache_t *pfx_cache = (perpfx_cache_t *)user;
 
@@ -1141,8 +1138,8 @@ static pfx_location_t *lookup_named(khash_t(name_runs) **map,
     return loc;
 }
 
-static int update_pfx(bvc_t *consumer, bgpstream_pfx_t *pfx,
-                perpfx_cache_t *pfx_cache, uint64_t *iptally) {
+static int update_pfx(ipmeta_worker_t *worker, bgpstream_pfx_t *pfx,
+                perpfx_cache_t *pfx_cache) {
     uint64_t num_ips = 0;
     uint64_t cur_addr = first_pfx_addr(pfx);
     ipmeta_record_t *rec = NULL;
@@ -1151,15 +1148,15 @@ static int update_pfx(bvc_t *consumer, bgpstream_pfx_t *pfx,
 
 
     /* Perform lookup */
-    ipmeta_record_set_clear(STATE->records);
+    ipmeta_record_set_clear(worker->records);
     if (bgpstream_pfx_snprintf(tolookup, INET6_ADDRSTRLEN + 6, pfx) == NULL) {
         fprintf(stderr,
                 "ERROR: unable to convert bgpstream prefix to string\n");
         return -1;
     }
 
-    num_recs = ipmeta_lookup_using_provider(STATE->ipmeta,
-            tolookup, STATE->provider, STATE->records);
+    num_recs = ipmeta_lookup_using_provider(worker->ipmeta,
+            tolookup, worker->provider, worker->records);
 
     if (num_recs < 0) {
         fprintf(stderr,
@@ -1170,9 +1167,9 @@ static int update_pfx(bvc_t *consumer, bgpstream_pfx_t *pfx,
     if (num_recs == 0) {
         return 0;
     }
-    ipmeta_record_set_rewind(STATE->records);
+    ipmeta_record_set_rewind(worker->records);
 
-    while ((rec = ipmeta_record_set_next(STATE->records, &num_ips))) {
+    while ((rec = ipmeta_record_set_next(worker->records, &num_ips))) {
         pfx_location_t *loc;
 
         /* continent */
@@ -1208,9 +1205,9 @@ static int update_pfx(bvc_t *consumer, bgpstream_pfx_t *pfx,
         /* city */
 
         cur_addr += num_ips;
-        (*iptally) += num_ips;
-
     }
+
+    /* All done, send a result back to the main thread */
     return 1;
 }
 
@@ -1288,53 +1285,161 @@ static int update_pfx_geo_iso2(bvc_t *consumer, khash_t(iso2_map) *aggs,
     return 0;
 }
 
+static int process_worker_results(bvc_t *consumer, int *jobsrem) {
+
+    int maxfd = -1, i, r;
+    fd_set readfds;
+    struct timeval tv;
+    ipmeta_result_t result;
+    int processed = 0;
+
+    FD_ZERO(&readfds);
+    *jobsrem = 0;
+
+    for (i = 0; i < STATE->worker_count; i++) {
+        if (STATE->worker_jobs_outstanding[i] == 0) {
+            continue;
+        }
+        *jobsrem += STATE->worker_jobs_outstanding[i];
+        FD_SET(STATE->worker_res_queues[i], &readfds);
+        if (STATE->worker_res_queues[i] > maxfd) {
+            maxfd = STATE->worker_res_queues[i];
+        }
+    }
+
+    if (maxfd == -1) {
+        /* no outstanding jobs */
+        return 0;
+    }
+
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    if (select(maxfd + 1, &readfds, NULL, NULL, &tv) == -1) {
+        fprintf(stderr, "ERROR: select() on worker result queues: %s\n",
+                strerror(errno));
+        return -1;
+    }
+
+    for (i = 0; i < STATE->worker_count; i++) {
+        if (STATE->worker_jobs_outstanding[i] == 0) {
+            continue;
+        }
+        if (!FD_ISSET(STATE->worker_res_queues[i], &readfds)) {
+            continue;
+        }
+        /* we have a result */
+        r = read(STATE->worker_res_queues[i], &result, sizeof(ipmeta_result_t));
+        if (r < 0) {
+            fprintf(stderr, "ERROR: while reading result from worker %d: %s\n",
+                    i, strerror(errno));
+            return -1;
+        }
+
+        if (r != sizeof(ipmeta_result_t)) {
+            fprintf(stderr,
+                    "ERROR: partial read of result from worker %d: %d\n",
+                    i, r);
+            return -1;
+        }
+
+        /* now the prefix cache holds geo info we can update the counters for
+         * each aggregate (continents, countries, regions) */
+
+        /* continents */
+        if (update_pfx_geo_iso2(consumer, STATE->continents,
+                result.cache->continents, result.pfx) < 0) {
+            return -1;
+        }
+
+        /* countries */
+        if (update_pfx_geo_iso2(consumer, STATE->countries,
+                result.cache->countries, result.pfx) < 0) {
+            return -1;
+        }
+        /* regions TODO */
+
+        /* cities TODO */
+
+        STATE->worker_jobs_outstanding[i] --;
+        (*jobsrem) --;
+        processed ++;
+    }
+    return processed;
+}
+
+#define MAX_OUTSTANDING_IPMETA_JOBS 10
+
 static int update_pfx_geo_information(bvc_t *consumer, bgpview_iter_t *it) {
     bgpstream_pfx_t *pfx = bgpview_iter_pfx_get_pfx(it);
     perpfx_cache_t *pfx_cache = (perpfx_cache_t *)bgpview_iter_pfx_get_user(it);
 
     uint64_t num_ips = 0;
     ipmeta_record_t *rec = NULL;
+    int assigned = 0;
+    ipmeta_job_t job;
 
-    int r;
+    int r, w, jobsrem, firstrun;
 
-    /* if the user pointer (cache) does not exist, then do the lookup now */
-    if (pfx_cache == NULL) {
-        if ((pfx_cache = malloc_zero(sizeof(perpfx_cache_t))) == NULL) {
-            fprintf(stderr, "Error: cannot create per-pfx cache\n");
+    firstrun = 1;
+    do {
+        r = process_worker_results(consumer, &jobsrem);
+        if (r == -1) {
+            break;
+        }
+        if (r > 0) {
+            /* keep reading results if they are available */
+            continue;
+        }
+
+        /* if the user pointer (cache) does not exist, then do the lookup now */
+        if (pfx_cache == NULL) {
+            if ((pfx_cache = malloc_zero(sizeof(perpfx_cache_t))) == NULL) {
+                fprintf(stderr, "Error: cannot create per-pfx cache\n");
+                return -1;
+            }
+
+            pfx_cache->continents = kh_init(iso2_runs);
+            pfx_cache->countries = kh_init(iso2_runs);
+            pfx_cache->regions = kh_init(name_runs);
+            pfx_cache->cities = kh_init(name_runs);
+
+            /* link the cache to the appropriate user ptr */
+            bgpview_iter_pfx_set_user(it, pfx_cache);
+        } else if (firstrun == 1) {
+            assert(0);
+        }
+        firstrun = 0;
+
+        w = STATE->next_worker;
+        if (STATE->worker_jobs_outstanding[w] >= MAX_OUTSTANDING_IPMETA_JOBS) {
+            /* too many outstanding jobs, wait for one to finish */
+            usleep(1000);
+            continue;
+        }
+
+        job.jobtype = IPMETA_JOB_LOOKUP;
+        job.pfx = pfx;
+        job.cache = pfx_cache;
+        r = write(STATE->worker_job_queues[w], &job, sizeof(ipmeta_job_t));
+        if (r < 0) {
+            fprintf(stderr,
+                    "ERROR: failed to push job onto queue for worker %d: %s\n",
+                    w, strerror(errno));
             return -1;
         }
-
-        pfx_cache->continents = kh_init(iso2_runs);
-        pfx_cache->countries = kh_init(iso2_runs);
-        pfx_cache->regions = kh_init(name_runs);
-        pfx_cache->cities = kh_init(name_runs);
-        if ((r = update_pfx(consumer, pfx, pfx_cache, &num_ips)) < 0) {
+        if (r != sizeof(ipmeta_job_t)) {
+            fprintf(stderr,
+                    "ERROR: unexpected write size for worker job: %d\n", r);
             return -1;
         }
-        if (r == 0) {
-            return 0;
+        assigned = 1;
+        STATE->worker_jobs_outstanding[w] += 1;
+        STATE->next_worker += 1;
+        while (STATE->next_worker >= STATE->worker_count) {
+            STATE->next_worker -= STATE->worker_count;
+            assert(STATE->next_worker >= 0);
         }
-
-        /* link the cache to the appropriate user ptr */
-        bgpview_iter_pfx_set_user(it, pfx_cache);
-    }
-    /* now the prefix cache holds geo info we can update the counters for each
-     * aggregate (continents, countries, polygons)  TODO */
-
-    /* continents */
-    if (update_pfx_geo_iso2(consumer, STATE->continents, pfx_cache->continents,
-            pfx) < 0) {
-        return -1;
-    }
-
-    /* countries */
-    if (update_pfx_geo_iso2(consumer, STATE->countries, pfx_cache->countries,
-            pfx) < 0) {
-        return -1;
-    }
-    /* regions */
-
-    /* cities */
+    } while (!assigned);
 
     return 0;
 }
@@ -1343,6 +1448,7 @@ static int update_pfx_geo_information(bvc_t *consumer, bgpview_iter_t *it) {
 static int compute_geo_pfx_visibility(bvc_t *consumer, bgpview_iter_t *it) {
     bgpstream_pfx_t *pfx;
     bgpstream_peer_sig_t *sg;
+    int r, jobsrem;
 
     /* for each prefix in the view */
     for (bgpview_iter_first_pfx(it, 0, BGPVIEW_FIELD_ACTIVE); //
@@ -1393,6 +1499,16 @@ static int compute_geo_pfx_visibility(bvc_t *consumer, bgpview_iter_t *it) {
             return -1;
         }
     }
+
+    /* wait for any outstanding worker jobs to complete */
+    jobsrem = 0;
+    do {
+        r = process_worker_results(consumer, &jobsrem);
+        if (r <= 0) {
+            break;
+        }
+    } while (jobsrem > 0);
+
 
     return 0;
 }
@@ -1506,6 +1622,115 @@ static int update_metrics(bvc_t *consumer) {
     return 0;
 }
 
+/* ==================== IPMETA WORKER FUNCTIONS =================== */
+static void init_ipmeta_worker(bvc_t *consumer,
+        ipmeta_worker_t *worker, int read_fd, int write_fd) {
+
+    memset(worker, 0, sizeof(ipmeta_worker_t));
+
+    worker->parent = consumer;
+    if (STATE->provider_config) {
+        worker->provider_config = strdup(STATE->provider_config);
+    }
+    worker->read_pipe = read_fd;
+    worker->write_pipe = write_fd;
+}
+
+static void deinit_ipmeta_worker(ipmeta_worker_t *worker) {
+    close(worker->read_pipe);
+    close(worker->write_pipe);
+
+    if (worker->provider_config) {
+        free(worker->provider_config);
+    }
+
+    if (worker->ipmeta != NULL) {
+        ipmeta_free(worker->ipmeta);
+        worker->ipmeta = NULL;
+    }
+
+    if (worker->records != NULL) {
+        ipmeta_record_set_free(&worker->records);
+        worker->records = NULL;
+    }
+
+}
+static void *run_ipmeta_worker(void *arg) {
+    ipmeta_worker_t *worker = (ipmeta_worker_t *)arg;
+    ipmeta_job_t incoming;
+    ipmeta_result_t reply;
+    int flags, r;
+    ssize_t inread;
+
+    if (init_ipmeta(worker) != 0) {
+        if (worker->workerid == 0) {
+            usage(worker->parent);
+        }
+        goto endthread;
+    }
+
+    flags = fcntl(worker->read_pipe, F_GETFL, 0);
+    if (flags == -1) {
+        fprintf(stderr, "fcntl F_GETFL failed in worker %d: %s\n",
+                worker->workerid, strerror(errno));
+        goto endthread;
+    }
+    flags |= O_NONBLOCK;
+    if (fcntl(worker->read_pipe, F_SETFL, flags) == -1) {
+        fprintf(stderr, "fcntl F_SETFL failed in worker %d: %s\n",
+                worker->workerid, strerror(errno));
+        goto endthread;
+    }
+
+    while (1) {
+        inread = read(worker->read_pipe, &incoming, sizeof(ipmeta_job_t));
+        if (inread == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(100000);
+                continue;
+            }
+            fprintf(stderr, "ERROR: reading from job queue in worker %d: %s %d\n",
+                    worker->workerid, strerror(errno), worker->read_pipe);
+            break;
+        }
+        if (inread != sizeof(ipmeta_job_t)) {
+            fprintf(stderr, "ERROR: partial read in worker %d: %zd\n",
+                    worker->workerid, inread);
+            break;
+        }
+
+        if (incoming.jobtype == IPMETA_JOB_HALT) {
+            fprintf(stderr, "Worker thread %d is now halting\n",
+                    worker->workerid);
+            break;
+        }
+
+        if (incoming.jobtype == IPMETA_JOB_LOOKUP) {
+            r = update_pfx(worker, incoming.pfx, incoming.cache);
+            reply.workerid = worker->workerid;
+            reply.pfx = incoming.pfx;
+            reply.cache = incoming.cache;
+            reply.result = r;
+            r = write(worker->write_pipe, &reply, sizeof(ipmeta_result_t));
+            if (r < 0) {
+                fprintf(stderr,
+                        "ERROR while writing result in worker thread %d: %s\n",
+                        worker->workerid, strerror(errno));
+                break;
+            }
+            if (r != sizeof(ipmeta_result_t)) {
+                fprintf(stderr,
+                        "ERROR, unexpected write size for result in worker thread %d: %d\n",
+                        worker->workerid, r);
+                break;
+            }
+        }
+    }
+
+endthread:
+    pthread_exit(NULL);
+}
+
 
 /* ==================== CONSUMER INTERFACE FUNCTIONS ==================== */
 
@@ -1515,6 +1740,7 @@ bvc_t *bvc_pergeovisibility_ipinfo_alloc() {
 
 int bvc_pergeovisibility_ipinfo_init(bvc_t *consumer, int argc, char **argv) {
     bvc_pergeovisibility_ipinfo_state_t *state = NULL;
+    int i;
 
     if ((state = malloc_zero(sizeof(bvc_pergeovisibility_ipinfo_state_t))) ==
             NULL) {
@@ -1535,20 +1761,63 @@ int bvc_pergeovisibility_ipinfo_init(bvc_t *consumer, int argc, char **argv) {
         fprintf(stderr, "ERROR: Could not initialize timeseries KP\n");
         goto err;
     }
+    STATE->worker_count = 1;
 
     /* parse the command line args */
     if (parse_args(consumer, argc, argv) != 0) {
         goto err;
     }
 
-    /* initialize ipmeta and provider */
-    if (init_ipmeta(consumer) != 0) {
-        usage(consumer);
-        return -1;
+    /* initialise and start the worker threads */
+    fprintf(stderr,
+            "INFO: starting up pergeovisibility-ipinfo with %d workers\n",
+            STATE->worker_count);
+
+    STATE->workers = calloc(STATE->worker_count, sizeof(ipmeta_worker_t));
+    STATE->worker_job_queues = calloc(STATE->worker_count, sizeof(int));
+    STATE->worker_res_queues = calloc(STATE->worker_count, sizeof(int));
+    STATE->worker_jobs_outstanding = calloc(STATE->worker_count, sizeof(int));
+    for (i = 0; i < STATE->worker_count; i++) {
+        int jobfds[2], resfds[2], flags;
+        if (pipe2(jobfds, O_DIRECT) < 0) {
+            fprintf(stderr,
+                    "ERROR: creating pipe: %s\n", strerror(errno));
+            goto err;
+        }
+        if (pipe2(resfds, O_DIRECT) < 0) {
+            fprintf(stderr,
+                    "ERROR: creating pipe: %s\n", strerror(errno));
+            goto err;
+        }
+
+        init_ipmeta_worker(consumer, &(STATE->workers[i]), jobfds[0],
+                resfds[1]);
+        STATE->workers[i].workerid = i;
+        STATE->worker_job_queues[i] = jobfds[1];
+        STATE->worker_res_queues[i] = resfds[0];
+        STATE->worker_jobs_outstanding[i] = 0;
+
+        if (resfds[1] > STATE->max_resfd) {
+            STATE->max_resfd = resfds[1];
+        }
+
+        flags = fcntl(resfds[1], F_GETFL, 0);
+        if (flags == -1) {
+            fprintf(stderr,
+                    "ERROR: fcntl F_GETGL: %s\n", strerror(errno));
+            goto err;
+        }
+        flags |= O_NONBLOCK;
+        if (fcntl(resfds[1], F_SETFL, flags) == -1) {
+            fprintf(stderr,
+                    "ERROR: fcntl F_SETFL: %s\n", strerror(errno));
+            goto err;
+        }
+
+        pthread_create(&(STATE->workers[i].pthreadid), NULL, run_ipmeta_worker,
+                &(STATE->workers[i]));
     }
 
-    /* the main hash table can be created only when ipmeta has been
-     * properly initialized */
     if (create_geo_pfxs_vis(consumer) != 0) {
         usage(consumer);
         goto err;
@@ -1570,11 +1839,30 @@ err:
 }
 
 void bvc_pergeovisibility_ipinfo_destroy(bvc_t *consumer) {
+    int i;
+    ipmeta_job_t haltjob;
+
     if (STATE == NULL) {
         return;
     }
 
-    destroy_ipmeta(consumer);
+    haltjob.jobtype = IPMETA_JOB_HALT;
+    haltjob.pfx = NULL;
+    haltjob.cache = NULL;
+    for (i = 0; i < STATE->worker_count; i++) {
+        /* if we fail, what are we going to do? */\
+        if (write(STATE->worker_job_queues[i], &haltjob,
+                sizeof(ipmeta_job_t)) == sizeof(ipmeta_job_t)) {
+            pthread_join(STATE->workers[i].pthreadid, NULL);
+        }
+        deinit_ipmeta_worker(&(STATE->workers[i]));
+        close(STATE->worker_job_queues[i]);
+        close(STATE->worker_res_queues[i]);
+    }
+    free(STATE->workers);
+    free(STATE->worker_job_queues);
+    free(STATE->worker_res_queues);
+    free(STATE->worker_jobs_outstanding);
 
     free(STATE->provider_config);
     STATE->provider_config = NULL;
@@ -1605,21 +1893,6 @@ int bvc_pergeovisibility_ipinfo_process_view(bvc_t *consumer, bgpview_t *view)
     /* set the pfx user pointer destructor function */
     bgpview_set_pfx_user_destructor(view, destroy_pfx_user_ptr);
 
-    if (STATE->last_reload == 0) {
-        STATE->last_reload = bgpview_get_time(view);
-    }
-
-    /* should we reload the ipmeta instance? (to pick up a new database) */
-    if (STATE->reload_freq > 0 &&
-            strcmp(STATE->provider_name, "memcache_psql") != 0 &&
-            bgpview_get_time(view) >= (STATE->last_reload +
-                    STATE->reload_freq)) {
-
-        if (reload_ipmeta(consumer, view) == -1) {
-            return -1;
-        }
-    }
-
     if (BVC_GET_CHAIN_STATE(consumer)->usable_table_flag[idx] == 0) {
         fprintf(stderr,
                 "WARN: View (%" PRIu32 ") is unusable for Per-Geo Visibility\n",
@@ -1649,6 +1922,11 @@ int bvc_pergeovisibility_ipinfo_process_view(bvc_t *consumer, bgpview_t *view)
     if (update_metrics(consumer) != 0) {
         return -1;
     }
+
+    clear_iso2_map(STATE->continents);
+    clear_iso2_map(STATE->countries);
+    clear_name_map(STATE->regions);
+    clear_name_map(STATE->cities);
 
     /* compute delays */
     processed_delay = epoch_sec() - bgpview_get_time(view);
