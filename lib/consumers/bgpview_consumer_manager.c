@@ -50,6 +50,7 @@
 
 /* Per-Geo Visibility consumer */
 #include "bvc_pergeovisibility.h"
+#include "bvc_pergeovisibility_ipinfo.h"
 
 /* Announced Prefixes consumer */
 #include "bvc_announcedpfxs.h"
@@ -182,6 +183,9 @@ static const consumer_alloc_func_t consumer_alloc_functions[] = {
 
   /** Pointer to pfx2as alloc function */
   bvc_pfx2as_alloc,
+
+  /** Pointer to pergeo vis using ipinfo alloc function */
+  bvc_pergeovisibility_ipinfo_alloc,
 
   /** Sample conditional consumer. If enabled, point to the alloc function,
       otherwise a NULL pointer to indicate the consumer is unavailable */
