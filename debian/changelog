@@ -1,3 +1,11 @@
+libbgpview2 (2.0.1~gt003) unstable; urgency=medium
+
+  * IPInfo geovisibility: ignore prefixes where IPInfo does not
+    have complete coverage for all contained IPs rather than
+    halting processing with an error return.
+
+ -- Shane Alcock <shane@alcock.co.nz>  Tue, 30 Apr 2024 17:59:41 +1200
+
 libbgpview2 (2.0.1~gt002) unstable; urgency=medium
 
   * Add new consumer: pergeovisibility_ipinfo
