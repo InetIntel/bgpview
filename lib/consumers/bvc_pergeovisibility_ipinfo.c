@@ -1480,8 +1480,8 @@ static int update_pfx_geo_information(bvc_t *consumer, bgpview_iter_t *it)
                     "addresses in prefix (%lu) are not identical.  Does "
                     "IPInfo have gaps?\n",
                     num_ips, last_pfx_addr(pfx) - first_pfx_addr(pfx) + 1);
-    fprintf(stderr, "Prefix was %s\n", bgpstream_pfx_snprintf(buf, 256, pfx));
-    return -1;
+    fprintf(stderr, "Ignoring the prefix: %s\n", bgpstream_pfx_snprintf(buf, 256, pfx));
+    return 0;
   }
 
   /* now the prefix cache holds geo info we can update the counters for each
