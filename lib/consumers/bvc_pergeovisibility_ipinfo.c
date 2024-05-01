@@ -79,6 +79,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <math.h>
+#include <errno.h>
 
 #define NAME "per-geo-visibility-ipinfo"
 #define METRIC_PREFIX "prefix-visibility"
@@ -1074,7 +1075,15 @@ static int load_regions_from_csv(bvc_t *consumer) {
       fprintf(stderr, "Line was: '%s'\n", buffer);
       goto end;
     }
+    if (strcmp(tok, "ioda_region_id") == 0) {
+        continue;
+    }
+    errno = 0;
     reg_id = strtoul(tok, NULL, 10);
+    if (errno) {
+        fprintf(stderr, "Invalid value for IODA region ID: %s", tok);
+        continue;
+    }
 
     tok = strtok(NULL, ",");
     if (tok == NULL) {
