@@ -90,6 +90,9 @@
 
 #define METRIC_PATH_NETACQ_EDGE_POLYS "geo.ipinfo"
 
+#define METRIC_PATH_GEOASN_COUNTRY "geoasn.ipinfo.country"
+#define METRIC_PATH_GEOASN_REGION "geoasn.ipinfo.region"
+
 #define METRIC_THRESH_FORMAT "v%d.visibility_threshold.%s.%s"
 
 #define META_METRIC_PREFIX_FORMAT "%s.meta.bgpview.consumer." NAME ".%s"
@@ -148,6 +151,8 @@ KHASH_INIT(slash24_id_set /* name */, uint32_t /* khkey_t */,
            char /* khval_t */, 0 /* kh_is_set */,
            kh_slash24_hash_func /*__hash_func */,
            kh_slash24_hash_equal /* __hash_equal */)
+
+
 
 /* We define our own set data structure because we need a different hash
  * function for dealing with our /24s.
@@ -256,6 +261,11 @@ typedef struct ip_addr_run {
 
 } ip_addr_run_t;
 
+typedef struct ip_addr_run_set {
+    ip_addr_run_t *runs;
+    uint64_t run_cnt;
+} ip_addr_run_set_t;
+
 typedef struct per_thresh {
 
   /* All the prefixes that belong to this threshold, i.e. they have been
@@ -296,6 +306,9 @@ typedef struct per_geo {
 
 } __attribute__((packed)) per_geo_t;
 
+KHASH_MAP_INIT_INT64(geo_as_run, ip_addr_run_set_t *)
+KHASH_MAP_INIT_INT64(geo_as, per_geo_t *)
+
 /** Attached to prefixes in the view to cache continent, country, region, and
  * polygon indices.
  */
@@ -329,6 +342,9 @@ typedef struct perpfx_cache {
   uint64_t *per_country_addr_run_cnt;
   uint64_t *per_country_addr6_pfx_cnt;
 
+  kh_geo_as_run_t *country_as_addr_runs;
+  kh_geo_as_run_t *region_as_addr_runs;
+
   /** Regions that this prefix belongs to */
   uint16_t *poly_table_idxs;
   /** Number of regions */
@@ -358,6 +374,7 @@ typedef struct bvc_pergeovisibility_state {
   ipmeta_record_set_t *records;
 
   char *regions_csv_file;
+  char *geoasn_csv_file;
 
   /** Array indexed by continent code */
   per_geo_t *continents[METRIC_ISO2_ASCII_MAX];
@@ -367,6 +384,9 @@ typedef struct bvc_pergeovisibility_state {
 
   /** Array of region IDs (specific to IODA) */
   per_geo_t **polygons;
+
+  kh_geo_as_t *geoasn_countries;
+  kh_geo_as_t *geoasn_regions;
 
   /** Array of table sizes */
   int polygons_cnt;
@@ -407,7 +427,7 @@ static int parse_args(bvc_t *consumer, int argc, char **argv)
   optind = 1;
 
   /* remember the argv strings DO NOT belong to us */
-  while ((opt = getopt(argc, argv, ":p:r:R:?")) >= 0) {
+  while ((opt = getopt(argc, argv, ":p:r:G:R:?")) >= 0) {
     switch (opt) {
     case 'p':
       STATE->provider_config = strdup(optarg);
@@ -420,6 +440,11 @@ static int parse_args(bvc_t *consumer, int argc, char **argv)
       STATE->regions_csv_file = strdup(optarg);
       assert(STATE->regions_csv_file != NULL);
       break;
+    case 'G':
+      STATE->geoasn_csv_file = strdup(optarg);
+      assert(STATE->geoasn_csv_file != NULL);
+      break;
+
     case '?':
     case ':':
     default:
@@ -938,6 +963,8 @@ static int init_ipmeta(bvc_t *consumer)
 static void destroy_ipmeta(bvc_t *consumer)
 {
   int i, j;
+  khiter_t k;
+  per_geo_t *pg;
 
   for (i = 0; i < METRIC_ISO2_ASCII_MAX; i++) {
     /* continents */
@@ -961,6 +988,30 @@ static void destroy_ipmeta(bvc_t *consumer)
   }
   STATE->polygons_cnt = 0;
 
+  if (STATE->geoasn_countries) {
+    for (k = kh_begin(STATE->geoasn_countries);
+            k != kh_end(STATE->geoasn_countries); ++k) {
+      if (!kh_exist(STATE->geoasn_countries, k)) {
+          continue;
+      }
+      pg = kh_val(STATE->geoasn_countries, k);
+      per_geo_destroy(pg);
+    }
+    kh_destroy(geo_as, STATE->geoasn_countries);
+  }
+
+  if (STATE->geoasn_regions) {
+    for (k = kh_begin(STATE->geoasn_regions);
+          k != kh_end(STATE->geoasn_regions); ++k) {
+      if (!kh_exist(STATE->geoasn_regions, k)) {
+          continue;
+      }
+      pg = kh_val(STATE->geoasn_regions, k);
+      per_geo_destroy(pg);
+    }
+    kh_destroy(geo_as, STATE->geoasn_regions);
+  }
+
   if (STATE->ipmeta != NULL) {
     ipmeta_free(STATE->ipmeta);
     STATE->ipmeta = NULL;
@@ -976,6 +1027,7 @@ static void destroy_pfx_user_ptr(void *user)
 {
   perpfx_cache_t *pfx_cache = (perpfx_cache_t *)user;
   int i, j;
+  khiter_t k;
 
   if (pfx_cache == NULL) {
     return;
@@ -1031,6 +1083,32 @@ static void destroy_pfx_user_ptr(void *user)
   pfx_cache->per_poly_addr_run_cnt = NULL;
   pfx_cache->per_poly_addr6_pfx_cnt = NULL;
 
+  for (k = kh_begin(pfx_cache->country_as_addr_runs);
+          k != kh_end(pfx_cache->country_as_addr_runs); ++k) {
+      ip_addr_run_set_t *runset;
+
+      if (!kh_exist(pfx_cache->country_as_addr_runs, k)) {
+          continue;
+      }
+      runset = kh_value(pfx_cache->country_as_addr_runs, k);
+      free(runset->runs);
+      free(runset);
+  }
+  kh_destroy(geo_as_run, pfx_cache->country_as_addr_runs);
+
+  for (k = kh_begin(pfx_cache->region_as_addr_runs);
+          k != kh_end(pfx_cache->region_as_addr_runs); ++k) {
+      ip_addr_run_set_t *runset;
+
+      if (!kh_exist(pfx_cache->region_as_addr_runs, k)) {
+          continue;
+      }
+      runset = kh_value(pfx_cache->region_as_addr_runs, k);
+      free(runset->runs);
+      free(runset);
+  }
+  kh_destroy(geo_as_run, pfx_cache->region_as_addr_runs);
+
   free(pfx_cache);
 }
 
@@ -1048,6 +1126,93 @@ static int clear_geocache(bvc_t *consumer, bgpview_t *view)
 
   bgpview_iter_destroy(it);
   return 0;
+}
+
+static int process_geoasn_line(bvc_t *consumer, char *buffer) {
+
+  char *tok;
+  uint64_t asn;
+  uint64_t key;
+  int khret;
+  khiter_t k;
+  char keystr[1024];
+  per_geo_t *pg;
+
+  tok = strtok(buffer, ",");
+  if (tok == NULL) {
+      return -1;
+  }
+
+  errno = 0;
+  asn = strtoul(tok, NULL, 10);
+  if (errno) {
+    fprintf(stderr, "Invalid ASN field: %s\n", tok);
+    return -1;
+  }
+
+  while ((tok = strtok(NULL, ",")) != NULL) {
+    if (tok[0] >= '0' && tok[0] <= '9') {
+      /* it is a region ID */
+      errno = 0;
+      key = strtoul(tok, NULL, 10);
+      if (errno) {
+          fprintf(stderr, "Invalid region ID: %s\n", tok);
+          return -1;
+      }
+      key += (asn << 32);
+      k = kh_put(geo_as, STATE->geoasn_regions, key, &khret);
+      if (khret != 0) {
+        snprintf(keystr, 1024, "%lu.%s", asn, tok);
+        METRIC_PREFIX_INIT(pg, METRIC_PATH_GEOASN_REGION, keystr);
+        kh_val(STATE->geoasn_regions, k) = pg;
+      }
+    } else {
+      /* it is a country (hopefully) */
+      if (strlen(tok) != 2) {
+          fprintf(stderr, "Invalid country code: %s\n", tok);
+          return -1;
+      }
+      key = (asn << 32) + (tok[0] << 8) + tok[1];
+      k = kh_put(geo_as, STATE->geoasn_countries, key, &khret);
+      if (khret != 0) {
+        snprintf(keystr, 1024, "%lu.%s", asn, tok);
+        METRIC_PREFIX_INIT(pg, METRIC_PATH_GEOASN_COUNTRY, keystr);
+        kh_val(STATE->geoasn_countries, k) = pg;
+      }
+    }
+  }
+  return 0;
+err:
+  return -1;
+}
+
+static int load_geoasn_from_csv(bvc_t *consumer) {
+  io_t *file;
+  char buffer[2048];
+  int read, rc = 1;
+
+  if (STATE->geoasn_csv_file == NULL) {
+      return 0;
+  }
+
+  if ((file = wandio_create(STATE->geoasn_csv_file)) == NULL) {
+    fprintf(stderr, "ERROR: failed to open file '%s'\n",
+        STATE->geoasn_csv_file);
+    return -1;
+  }
+
+  while ((read = wandio_fgets(file, &buffer, 2048, 0)) > 0) {
+    if (strlen(buffer) == 0) {
+        continue;
+    }
+    if (process_geoasn_line(consumer, buffer) < 0) {
+      fprintf(stderr, "Malformed line in region csv file: %s \n", buffer);
+      rc = -1;
+      break;
+    }
+  }
+  wandio_destroy(file);
+  return rc;
 }
 
 static int load_regions_from_csv(bvc_t *consumer) {
@@ -1214,14 +1379,52 @@ static int create_geo_pfxs_vis(bvc_t *consumer)
       goto err;
   }
 
+  STATE->geoasn_countries = kh_init(geo_as);
+  STATE->geoasn_regions = kh_init(geo_as);
+  if (load_geoasn_from_csv(consumer) < 0) {
+      goto err;
+  }
+
   return 0;
 
 err:
   return -1;
 }
 
-static int lookup_polygon(perpfx_cache_t *pfx_cache, ipmeta_record_t *rec) {
-  int i;
+static int lookup_polygon(bvc_pergeovisibility_state_t *state,
+            bgpstream_pfx_t *pfx, perpfx_cache_t *pfx_cache,
+            ipmeta_record_t *rec, uint64_t curr_address, uint64_t num_ips) {
+  int i, khret;
+  uint64_t as_key = 0, base_key = 0;
+  khiter_t k;
+  ip_addr_run_set_t *runset;
+
+  base_key = rec->region_code;
+
+  if (state->geoasn_regions) {
+    /* Track the region-AS couplet */
+    for (i = 0; i < state->valid_origins; i++) {
+      as_key = base_key + (((uint64_t)state->origin_asns[i]) << 32);
+
+      /* only track region-AS pairs that were explicitly requested */
+      k = kh_get(geo_as, state->geoasn_regions, as_key);
+      if (k == kh_end(state->geoasn_regions)) {
+          continue;
+      }
+      k = kh_put(geo_as_run, pfx_cache->region_as_addr_runs, as_key, &khret);
+
+      if (khret != 0) {
+          /* new country-AS key */
+        runset = calloc(1, sizeof(ip_addr_run_set_t));
+        kh_val(pfx_cache->region_as_addr_runs, k) = runset;
+      } else {
+        runset = kh_val(pfx_cache->region_as_addr_runs, k);
+      }
+
+      runset->runs = update_ip_addr_run(runset->runs, &(runset->run_cnt),
+            curr_address, num_ips);
+    }
+  }
 
   /* this is a polygon from one of the tables that we are tracking */
   /* check if it is already in our cache */
@@ -1253,14 +1456,45 @@ static int lookup_polygon(perpfx_cache_t *pfx_cache, ipmeta_record_t *rec) {
   return i;
 }
 
-static int lookup_country(perpfx_cache_t *pfx_cache, ipmeta_record_t *rec) {
+static int lookup_country(bvc_pergeovisibility_state_t *state,
+            bgpstream_pfx_t *pfx, perpfx_cache_t *pfx_cache,
+            ipmeta_record_t *rec, uint64_t curr_address, uint64_t num_ips) {
 
   int cont_idx = 0x3F3F;
-  int i;
+  int i, khret;
+  uint64_t as_key = 0, base_key = 0;
+  khiter_t k;
+  ip_addr_run_set_t *runset;
 
   if (rec->country_code[0] != '\0') {
     cont_idx = CC_16(rec->country_code);
   }
+
+  if (state->geoasn_countries) {
+    base_key = (rec->country_code[0] << 8) + (rec->country_code[1]);
+
+    for (i = 0; i < state->valid_origins; i++) {
+      as_key = base_key + (((uint64_t)state->origin_asns[i]) << 32);
+      /* only track country-AS pairs that were explicitly requested */
+      k = kh_get(geo_as, state->geoasn_countries, as_key);
+      if (k == kh_end(state->geoasn_countries)) {
+          continue;
+      }
+      k = kh_put(geo_as_run, pfx_cache->country_as_addr_runs, as_key, &khret);
+
+      if (khret != 0) {
+          /* new country-AS key */
+          runset = calloc(1, sizeof(ip_addr_run_set_t));
+          kh_val(pfx_cache->country_as_addr_runs, k) = runset;
+      } else {
+          runset = kh_val(pfx_cache->country_as_addr_runs, k);
+      }
+
+      runset->runs = update_ip_addr_run(runset->runs, &(runset->run_cnt),
+              curr_address, num_ips);
+    }
+  }
+
   /* add country if it doesn't exist already */
 
   /** XXX performance? */
@@ -1357,7 +1591,7 @@ static int update_pfx_v6(bvc_t *consumer, bgpstream_pfx_t *pfx,
       return -1;
     }
 
-    ind = lookup_country(pfx_cache, rec);
+    ind = lookup_country(STATE, pfx, pfx_cache, rec, cur_address, num_ips);
     if (ind < 0) {
       return -1;
     }
@@ -1367,7 +1601,7 @@ static int update_pfx_v6(bvc_t *consumer, bgpstream_pfx_t *pfx,
       return -1;
     }
 
-    ind = lookup_polygon(pfx_cache, rec);
+    ind = lookup_polygon(STATE, pfx, pfx_cache, rec, cur_address, num_ips);
     if (ind < 0) {
       return -1;
     }
@@ -1411,7 +1645,7 @@ static int update_pfx_v4(bvc_t *consumer, bgpstream_pfx_t *pfx,
       return -1;
     }
 
-    ind = lookup_country(pfx_cache, rec);
+    ind = lookup_country(STATE, pfx, pfx_cache, rec, cur_address, num_ips);
     if (ind < 0) {
       return -1;
     }
@@ -1422,7 +1656,7 @@ static int update_pfx_v4(bvc_t *consumer, bgpstream_pfx_t *pfx,
       return -1;
     }
 
-    ind = lookup_polygon(pfx_cache, rec);
+    ind = lookup_polygon(STATE, pfx, pfx_cache, rec, cur_address, num_ips);
     if (ind < 0) {
       return -1;
     }
@@ -1454,12 +1688,19 @@ static int update_pfx_geo_information(bvc_t *consumer, bgpview_iter_t *it)
   int found;
   int rec_c = 0;
 
+  per_geo_t *pg;
+  khiter_t k, k_pg;
+  ip_addr_run_set_t *runs;
+
   /* if the user pointer (cache) does not exist, then do the lookup now */
   if (pfx_cache == NULL) {
     if ((pfx_cache = malloc_zero(sizeof(perpfx_cache_t))) == NULL) {
       fprintf(stderr, "Error: cannot create per-pfx cache\n");
       return -1;
     }
+
+    pfx_cache->country_as_addr_runs = kh_init(geo_as_run);
+    pfx_cache->region_as_addr_runs = kh_init(geo_as_run);
 
     if (pfx->address.version == BGPSTREAM_ADDR_VERSION_IPV4) {
       if (update_pfx_v4(consumer, pfx, pfx_cache, &num_ips) < 0) {
@@ -1478,7 +1719,7 @@ static int update_pfx_geo_information(bvc_t *consumer, bgpview_iter_t *it)
     bgpview_iter_pfx_set_user(it, pfx_cache);
   }
 
-  /* Ensure that the sum of NetAcuity block lengths is identical to the number
+  /* Ensure that the sum of IPInfo block lengths is identical to the number
    * of addresses in the given prefix.  This is a crucial assumption for our
    * algorithm.
    */
@@ -1551,6 +1792,59 @@ static int update_pfx_geo_information(bvc_t *consumer, bgpview_iter_t *it)
       return -1;
     }
   }
+
+  if (STATE->geoasn_countries) {
+    for (k = kh_begin(pfx_cache->country_as_addr_runs);
+          k != kh_end(pfx_cache->country_as_addr_runs); ++k) {
+      if (!kh_exist(pfx_cache->country_as_addr_runs, k)) {
+        continue;
+      }
+      k_pg = kh_get(geo_as, STATE->geoasn_countries,
+          kh_key(pfx_cache->country_as_addr_runs, k));
+      if (k_pg == kh_end(STATE->geoasn_countries)) {
+        continue;
+      }
+
+      runs = kh_val(pfx_cache->country_as_addr_runs, k);
+      pg = kh_val(STATE->geoasn_countries, k_pg);
+
+      if (pfx->address.version == BGPSTREAM_ADDR_VERSION_IPV4) {
+        if (per_geo_update(consumer, pg, pfx, runs->runs,
+                    runs->run_cnt, 0) != 0) {
+          return -1;
+        }
+      } else {
+        /* TODO IPv6 ... */
+      }
+    }
+  }
+
+  if (STATE->geoasn_regions) {
+    for (k = kh_begin(pfx_cache->region_as_addr_runs);
+          k != kh_end(pfx_cache->region_as_addr_runs); ++k) {
+      if (!kh_exist(pfx_cache->region_as_addr_runs, k)) {
+        continue;
+      }
+      k_pg = kh_get(geo_as, STATE->geoasn_regions,
+          kh_key(pfx_cache->region_as_addr_runs, k));
+      if (k_pg == kh_end(STATE->geoasn_regions)) {
+        continue;
+      }
+
+      runs = kh_val(pfx_cache->region_as_addr_runs, k);
+      pg = kh_val(STATE->geoasn_regions, k_pg);
+
+      if (pfx->address.version == BGPSTREAM_ADDR_VERSION_IPV4) {
+        if (per_geo_update(consumer, pg, pfx, runs->runs,
+                    runs->run_cnt, 0) != 0) {
+          return -1;
+        }
+      } else {
+        /* TODO IPv6 ... */
+      }
+    }
+  }
+
   return 0;
 }
 
@@ -1691,6 +1985,8 @@ static int update_per_geo_metrics(bvc_t *consumer, per_geo_t *pg, int index)
 static int update_metrics(bvc_t *consumer)
 {
   int i;
+  khiter_t k;
+  per_geo_t *pg;
 
   /* for each continent and country */
   for (i = 0; i < METRIC_ISO2_ASCII_MAX; i++) {
@@ -1710,6 +2006,34 @@ static int update_metrics(bvc_t *consumer)
     if (STATE->polygons[i] != NULL &&
         update_per_geo_metrics(consumer, STATE->polygons[i], 0) != 0) {
       return -1;
+    }
+  }
+
+  /* for each asn-country couplet */
+  if (STATE->geoasn_countries) {
+    for (k = kh_begin(STATE->geoasn_countries);
+        k != kh_end(STATE->geoasn_countries); ++k) {
+      if (!kh_exist( STATE->geoasn_countries, k)) {
+        continue;
+      }
+      pg = kh_value(STATE->geoasn_countries, k);
+      if (update_per_geo_metrics(consumer, pg, 0) != 0) {
+        return -1;
+      }
+    }
+  }
+
+  /* for each asn-country couplet */
+  if (STATE->geoasn_regions) {
+    for (k = kh_begin(STATE->geoasn_regions);
+        k != kh_end(STATE->geoasn_regions); ++k) {
+      if (!kh_exist( STATE->geoasn_regions, k)) {
+        continue;
+      }
+      pg = kh_value(STATE->geoasn_regions, k);
+      if (update_per_geo_metrics(consumer, pg, 0) != 0) {
+        return -1;
+      }
     }
   }
   return 0;
@@ -1788,10 +2112,14 @@ void bvc_pergeovisibility_ipinfo_destroy(bvc_t *consumer)
 
   free(STATE->provider_config);
   free(STATE->regions_csv_file);
+  if (STATE->geoasn_csv_file) {
+    free(STATE->geoasn_csv_file);
+  }
   STATE->provider_config = NULL;
   STATE->provider_name = NULL;
   STATE->provider_arg = NULL;
   STATE->regions_csv_file = NULL;
+  STATE->geoasn_csv_file = NULL;
 
   if (STATE->ff_asns != NULL) {
     bgpstream_id_set_destroy(STATE->ff_asns);
