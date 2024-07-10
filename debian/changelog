@@ -1,3 +1,9 @@
+libbgpview2 (2.0.1~gt005) unstable; urgency=medium
+
+  * Re-package to force dependency on latest libbgpstream
+
+ -- Shane Alcock <shane@alcock.co.nz>  Wed, 01 May 2024 15:16:09 +1200
+
 libbgpview2 (2.0.1~gt004) unstable; urgency=medium
 
   * IPInfo geovisibility: ignore lines in regions CSV that do not
