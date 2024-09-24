@@ -1130,7 +1130,7 @@ static int clear_geocache(bvc_t *consumer, bgpview_t *view)
 
 static int process_geoasn_line(bvc_t *consumer, char *buffer) {
 
-  char *tok;
+  char *tok, *p;
   uint64_t asn;
   uint64_t key;
   int khret;
@@ -1168,6 +1168,12 @@ static int process_geoasn_line(bvc_t *consumer, char *buffer) {
       }
     } else {
       /* it is a country (hopefully) */
+      if ((p = strchr(tok, '\n')) != NULL) {
+         *p = '\0';
+      }
+      if (*tok == '\0') {
+         break;
+      }
       if (strlen(tok) != 2) {
           fprintf(stderr, "Invalid country code: %s\n", tok);
           return -1;
