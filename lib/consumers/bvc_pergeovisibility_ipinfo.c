@@ -1151,6 +1151,12 @@ static int process_geoasn_line(bvc_t *consumer, char *buffer) {
   }
 
   while ((tok = strtok(NULL, ",")) != NULL) {
+    if ((p = strchr(tok, '\n')) != NULL) {
+      *p = '\0';
+    }
+    if (*tok == '\0') {
+      break;
+    }
     if (tok[0] >= '0' && tok[0] <= '9') {
       /* it is a region ID */
       errno = 0;
@@ -1168,12 +1174,6 @@ static int process_geoasn_line(bvc_t *consumer, char *buffer) {
       }
     } else {
       /* it is a country (hopefully) */
-      if ((p = strchr(tok, '\n')) != NULL) {
-         *p = '\0';
-      }
-      if (*tok == '\0') {
-         break;
-      }
       if (strlen(tok) != 2) {
           fprintf(stderr, "Invalid country code: %s\n", tok);
           return -1;
