@@ -1021,10 +1021,8 @@ bgpview_io_bsrt_t *bgpview_io_bsrt_init(const char *opts, timeseries_t *timeseri
     fprintf(stderr, "ERROR: Could not create BGPStream instance\n");
     goto err;
   }
-  if (bsrt->di_id != 0) {
-    bsrt->di_id_default = bsrt->di_id = bgpstream_get_data_interface_id(bsrt->stream);
-    bsrt->di_info = bgpstream_get_data_interface_info(bsrt->stream, bsrt->di_id);
-  }
+  bsrt->di_id_default = bsrt->di_id = bgpstream_get_data_interface_id(bsrt->stream);
+  bsrt->di_info = bgpstream_get_data_interface_info(bsrt->stream, bsrt->di_id);
 
   if (opts != NULL && (len = strlen(opts)) > 0) {
     // parse the option string ready for getopt
