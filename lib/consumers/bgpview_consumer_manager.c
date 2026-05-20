@@ -95,6 +95,9 @@
 /* Prefix to AS consumer */
 #include "bvc_pfx2as.h"
 
+/* Pathinfo consumer */
+#include "bvc_pathinfo.h"
+
 /* ==================== PRIVATE DATA STRUCTURES ==================== */
 
 #define MAXOPTS 1024
@@ -186,6 +189,9 @@ static const consumer_alloc_func_t consumer_alloc_functions[] = {
 
   /** Pointer to pergeo vis using ipinfo alloc function */
   bvc_pergeovisibility_ipinfo_alloc,
+
+  /** Pointer to pathinfo alloc function */
+  bvc_pathinfo_alloc,
 
   /** Sample conditional consumer. If enabled, point to the alloc function,
       otherwise a NULL pointer to indicate the consumer is unavailable */

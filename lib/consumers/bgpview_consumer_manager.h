@@ -181,13 +181,16 @@ typedef enum bvc_id {
    *  geolocation is performed using ipinfo data.
    */
   BVC_ID_PERGEOVISIBILITY_IPINFO = 20,
+
+  /** Outputs prefix, peer, geo, and complete AS paths */
+  BVC_ID_PATHINFO = 21,
   /** @todo add more consumers here */
 
   /** Lowest numbered bgpview consumer ID */
   BVC_ID_FIRST = BVC_ID_TEST,
 
   /** Highest numbered bgpview consumer ID */
-  BVC_ID_LAST = BVC_ID_PERGEOVISIBILITY_IPINFO,
+  BVC_ID_LAST = BVC_ID_PATHINFO,
 
 } bvc_id_t;
 

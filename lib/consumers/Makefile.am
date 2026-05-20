@@ -148,6 +148,11 @@ CONSUMER_SRCS += \
 	bvc_pfx2as.c \
 	bvc_pfx2as.h
 
+# Pathinfo consumer
+CONSUMER_SRCS += \
+	bvc_pathinfo.c \
+	bvc_pathinfo.h
+
 # -- sample how to add conditional consumer
 #if WITH_<NAME>
 #SUBDIRS += lib<name>

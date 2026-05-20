@@ -386,9 +386,16 @@ static int apply_end_of_valid_rib_operations(routingtables_t *rt)
 {
   int khret;
 
+  fprintf(stderr, "DEBUG_RIB: apply_end_of_valid_rib_operations started\n");
+
   rt_kh_for(k, rt->collectors) {
     if (!kh_exist(rt->collectors, k)) continue;
     collector_t *c = kh_val(rt->collectors, k);
+    if (c->bgp_time_uc_rib_dump_time != 0) {
+      c->eovrib_flag = 1;
+    }
+    fprintf(stderr, "DEBUG_RIB: collector %s eovrib_flag=%d, peerids_size=%d\n",
+            c->collector_str, c->eovrib_flag, kh_size(c->collector_peerids));
     if (c->eovrib_flag != 0) {
       rt_kh_for(i, c->collector_peerids) {
         if (!kh_exist(c->collector_peerids, i)) continue;
