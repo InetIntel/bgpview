@@ -209,7 +209,9 @@ static int deserialize_metadata(bgpview_io_kafka_md_t *meta, uint8_t *buf,
 
   /* Identity */
   BGPVIEW_IO_DESERIALIZE_VAL(buf, len, read, ident_len);
-  assert((len - read) >= ident_len);
+  if ((len - read) < ident_len) {
+    return -1;
+  }
   memcpy(meta->identity, buf, ident_len);
   meta->identity[ident_len] = '\0';
   buf += ident_len;
@@ -318,7 +320,9 @@ static int deserialize_global_metadata(bgpview_io_kafka_md_t **metasptr,
   // that
   BGPVIEW_IO_DESERIALIZE_VAL(buf, len, read, *last_sync_offset);
 
-  assert(read == len);
+  if (read != len) {
+    goto err;
+  }
 
   *metasptr = metas;
   return members_cnt;
@@ -558,14 +562,23 @@ static int process_peers_message(rd_kafka_message_t *msg,
   if (type == 'E') {
     /* end of peers */
     BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, vtime);
-    assert(vtime == exp_time);
+    if (vtime != exp_time) {
+      fprintf(stderr, "ERROR: Expected view time %u but got %u\n", exp_time, vtime);
+      return -1;
+    }
     BGPVIEW_IO_DESERIALIZE_VAL(ptr, msg->len, read, peer_cnt);
-    assert(*peers_rx == peer_cnt);
+    if (*peers_rx != peer_cnt) {
+      fprintf(stderr, "ERROR: Expected %d peers but got %d\n", peer_cnt, *peers_rx);
+      return -1;
+    }
 
     return 0;
   }
 
-  assert(type == 'P');
+  if (type != 'P') {
+    fprintf(stderr, "ERROR: Expected peer type 'P' but got '%c'\n", type);
+    return -1;
+  }
 
   if ((s = bgpview_io_deserialize_peer(ptr, msg->len, &peerid_remote, &ps)) <
       0) {
@@ -647,7 +660,11 @@ static int recv_peers(bgpview_io_kafka_peeridmap_t *idmap, const char *tname,
       goto err;
     }
     if (seeked == 0) {
-      assert(msg->offset == offset);
+      if (msg->offset != offset) {
+        fprintf(stderr, "ERROR: Expected peer offset %" PRIi64 " but got %" PRIi64 "\n",
+                offset, msg->offset);
+        goto err;
+      }
       seeked = 1;
     }
 
@@ -770,7 +787,10 @@ static int process_pfx_message(rd_kafka_message_t *msg,
     fprintf(stderr, "DEBUG: pfx_cnt: %" PRIu32 ", pfx_rx: %" PRIu32 "\n",
             pfx_cnt, *pfx_rx);
 
-    assert(view_time == exp_time);
+    if (view_time != exp_time) {
+      fprintf(stderr, "ERROR: Expected view time %u but got %u\n", exp_time, view_time);
+      return -1;
+    }
     if (*pfx_rx != pfx_cnt || read != msg->len) {
       fprintf(stderr, "WARN: Invalid prefix table received from %s\n",
               topicname);
@@ -830,7 +850,13 @@ static int process_pfx_message(rd_kafka_message_t *msg,
       break;
 
     default:
-      assert(0);
+#ifdef WITH_THREADS
+      if (mutex != NULL) {
+        pthread_mutex_unlock(mutex);
+      }
+#endif
+      fprintf(stderr, "ERROR: Unexpected prefix row type '%c'\n", type);
+      return -1;
     }
 
     /* read the type of the next row */
@@ -845,7 +871,10 @@ static int process_pfx_message(rd_kafka_message_t *msg,
   }
 #endif
 
-  assert(read == msg->len);
+  if (read != msg->len) {
+    fprintf(stderr, "ERROR: Message read length mismatch (read %zu, len %zu)\n", read, msg->len);
+    return -1;
+  }
   return 1;
 }
 
@@ -896,7 +925,11 @@ static int recv_pfxs(bgpview_io_kafka_peeridmap_t *idmap, const char *tname,
       goto err;
     }
     if (seeked == 0) {
-      assert(msg->offset == offset);
+      if (msg->offset != offset) {
+        fprintf(stderr, "ERROR: Expected prefix offset %" PRIi64 " but got %" PRIi64 "\n",
+                offset, msg->offset);
+        goto err;
+      }
       seeked = 1;
     }
 
